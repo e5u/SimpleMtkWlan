@@ -266,6 +266,7 @@ public:
     IOReturn copyWCLExtendedBss(void *);
     IOReturn copyWCLChannels(void *);
     IOReturn copyWCLTrafficCounters(void *);
+    IOReturn applyWCLRoamLock(void *);
 #else
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #endif
@@ -361,7 +362,11 @@ public:
     virtual IOReturn setWCL_LEAVE_NETWORK(apple80211_leave_network *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #endif
     virtual IOReturn setWCL_REASSOC(apple80211_reassoc *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#ifdef AIRPORT_WCL
+    IOReturn setWCL_SET_ROAM_LOCK(apple80211_set_roam_lock *) override;
+#else
     virtual IOReturn setWCL_SET_ROAM_LOCK(apple80211_set_roam_lock *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#endif
     virtual IOReturn setWCL_ROAM_PROFILE_CONFIG(apple80211_roam_profile_config *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_PROFILE_CONFIGV1(apple80211_roam_profile_configV1 *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_USER_CACHE(apple80211_user_roam_cache *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }

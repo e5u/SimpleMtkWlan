@@ -172,6 +172,7 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
     if (self->wclStopping)
         return kIOReturnNotReady;
     switch (uintptr_t(a1)) {
+        case 16: return self->applyWCLRoamLock(a2);
         case 13: return self->copyWCLChannels(a2);
         case 14: return self->copyWCLTrafficCounters(a2);
         case 15:
@@ -209,6 +210,27 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
 IOReturn AirportItlwmSkywalkInterface::setWCL_SCAN_REQ(apple80211ScanRequest *request)
 {
     return _fCommandGate->runAction(wclCommand, this, nullptr, request);
+}
+
+IOReturn AirportItlwmSkywalkInterface::setWCL_SET_ROAM_LOCK(apple80211_set_roam_lock *data)
+{
+    if (!data)
+        return kIOReturnBadArgument;
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(16), data);
+}
+
+IOReturn AirportItlwmSkywalkInterface::applyWCLRoamLock(void *data)
+{
+    if (!data)
+        return kIOReturnBadArgument;
+    if (!fHalService)
+        return kIOReturnNotReady;
+    // Native WCL consumes the first byte as bool and sets firmware roam_off.
+    fHalService->get80211Controller()->ic_wcl_roam_locked =
+        *static_cast<const uint8_t *>(data) != 0;
+    return kIOReturnSuccess;
 }
 
 IOReturn AirportItlwmSkywalkInterface::setWCL_SCAN_ABORT(void *)

@@ -369,7 +369,7 @@ bool AirportItlwm::start(IOService *provider)
 
 #ifdef AIRPORT_WCL
     int he_enabled = 0;
-    if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
+    if (PE_parse_boot_argn("-mtkhe", &he_enabled, sizeof(he_enabled)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
 #endif
 
@@ -748,17 +748,27 @@ IOReturn AirportItlwm::outputStart(IONetworkInterface *interface, IOOptionBits o
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     mbuf_t m = NULL;
 #ifdef AIRPORT_WCL
-    if (!ifp->if_snd.queue)
+    if (!ifp->if_snd.queue) {
+        fHalService->accountOutputStart(1);
         return kIOReturnNoResources;
+    }
     if (!ifq_empty(&ifp->if_snd))
         (*ifp->if_start)(ifp);
     const uint32_t capacity = ifp->if_snd.queue->getCapacity();
     const uint32_t queued = ifq_len(&ifp->if_snd);
-    if (ifq_is_oactive(&ifp->if_snd) || queued >= capacity)
+    if (ifq_is_oactive(&ifp->if_snd)) {
+        fHalService->accountOutputStart(2);
         return kIOReturnNoResources;
+    }
+    if (queued >= capacity) {
+        fHalService->accountOutputStart(3);
+        return kIOReturnNoResources;
+    }
     const uint32_t count = MIN(32U, capacity - queued);
-    if (interface->dequeueOutputPackets(count, &m) != kIOReturnSuccess || !m)
+    if (interface->dequeueOutputPackets(count, &m) != kIOReturnSuccess || !m) {
+        fHalService->accountOutputStart(4);
         return kIOReturnSuccess;
+    }
     while (m) {
         mbuf_t next = mbuf_nextpkt(m);
         mbuf_setnextpkt(m, NULL);
@@ -766,16 +776,22 @@ IOReturn AirportItlwm::outputStart(IONetworkInterface *interface, IOOptionBits o
         m = next;
     }
     (*ifp->if_start)(ifp);
-    if (ifq_is_oactive(&ifp->if_snd))
+    if (ifq_is_oactive(&ifp->if_snd)) {
+        fHalService->accountOutputStart(5);
         return kIOReturnNoResources;
+    }
     return kIOReturnSuccess;
 #else
-    if (ifq_is_oactive(&ifp->if_snd))
+    if (ifq_is_oactive(&ifp->if_snd)) {
+        fHalService->accountOutputStart(2);
         return kIOReturnNoResources;
+    }
     while (kIOReturnSuccess == interface->dequeueOutputPackets(1, &m)) {
         if (outputPacket(m, NULL)!= kIOReturnOutputSuccess ||
-            ifq_is_oactive(&ifp->if_snd))
+            ifq_is_oactive(&ifp->if_snd)) {
+            fHalService->accountOutputStart(5);
             return kIOReturnNoResources;
+        }
     }
     return kIOReturnSuccess;
 #endif
