@@ -429,11 +429,12 @@ enum mt76_rxq_id {
 #define	MWX_WTBL_RESERVED	(MWX_WTBL_SIZE - 1)
 #define	MWX_WTBL_STA		(MWX_WTBL_RESERVED - MWX_MAX_INTERFACES)
 
+/* 2 KiB RX payloads; the DMA-safe pool carves 4 KiB pages into two buffers. */
 #define	MT_RX_BUF_SIZE		2048
 #define	MT_MAX_SCATTER		4	/* limit of MT_HW_TXP_MAX_BUF_NUM */
 #define	MT_MAX_SIZE		MT_DMA_CTL_SD_LEN_MASK
 
-#define	MWX_TXWI_MAX		512	/* HW limit is 8192 */
+#define	MWX_TXWI_MAX		2048	/* HW limit is 8192 */
 
 #define	MT_PACKET_ID_MASK		0x7f
 #define	MT_PACKET_ID_NO_ACK		0
@@ -1432,6 +1433,81 @@ enum mcu_cipher_type {
 };
 
 
+#define	STA_REC_HE_CAP_HTC		(1U << 0)
+#define	STA_REC_HE_CAP_BQR		(1U << 1)
+#define	STA_REC_HE_CAP_BSR		(1U << 2)
+#define	STA_REC_HE_CAP_OM		(1U << 3)
+#define	STA_REC_HE_CAP_AMSDU_IN_AMPDU	(1U << 4)
+#define	STA_REC_HE_CAP_DUAL_BAND		(1U << 5)
+#define	STA_REC_HE_CAP_LDPC		(1U << 6)
+#define	STA_REC_HE_CAP_TRIG_CQI_FK	(1U << 7)
+#define	STA_REC_HE_CAP_PARTIAL_BW_EXT_RANGE (1U << 8)
+#define	STA_REC_HE_CAP_LE_EQ_80M_TX_STBC	(1U << 9)
+#define	STA_REC_HE_CAP_LE_EQ_80M_RX_STBC	(1U << 10)
+#define	STA_REC_HE_CAP_GT_80M_TX_STBC	(1U << 11)
+#define	STA_REC_HE_CAP_GT_80M_RX_STBC	(1U << 12)
+#define	STA_REC_HE_CAP_SU_PPDU_1LTF_8US_GI (1U << 13)
+#define	STA_REC_HE_CAP_SU_MU_PPDU_4LTF_8US_GI (1U << 14)
+#define	STA_REC_HE_CAP_ER_SU_PPDU_1LTF_8US_GI (1U << 15)
+#define	STA_REC_HE_CAP_ER_SU_PPDU_4LTF_8US_GI (1U << 16)
+#define	STA_REC_HE_CAP_NDP_4LTF_3DOT2MS_GI (1U << 17)
+#define	STA_REC_HE_CAP_BW20_RU242_SUPPORT (1U << 18)
+#define	STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242 (1U << 19)
+#define	STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242 (1U << 20)
+#define	STA_REC_HE			0x06
+#define	STA_REC_HE_V2			0x19
+#define	CMD_HE_MCS_BW80			0
+#define	CMD_HE_MCS_BW160		1
+#define	CMD_HE_MCS_BW8080		2
+#define	CMD_HE_MCS_BW_NUM		3
+
+struct sta_rec_he {
+	uint16_t	tag;
+	uint16_t	len;
+	uint32_t	he_cap;
+	uint8_t		t_frame_dur;
+	uint8_t		max_ampdu_exp;
+	uint8_t		bw_set;
+	uint8_t		device_class;
+	uint8_t		dcm_tx_mode;
+	uint8_t		dcm_tx_max_nss;
+	uint8_t		dcm_rx_mode;
+	uint8_t		dcm_rx_max_nss;
+	uint8_t		dcm_max_ru;
+	uint8_t		punc_pream_rx;
+	uint8_t		pkt_ext;
+	uint8_t		rsv1;
+	uint16_t	max_nss_mcs[CMD_HE_MCS_BW_NUM];
+	uint8_t		rsv2[2];
+} __packed;
+
+struct sta_rec_he_v2 {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		he_mac_cap[6];
+	uint8_t		he_phy_cap[11];
+	uint8_t		pkt_ext;
+	uint16_t	max_nss_mcs[CMD_HE_MCS_BW_NUM];
+} __packed;
+
+struct bss_info_uni_he {
+	uint16_t	tag;
+	uint16_t	len;
+	uint16_t	he_rts_thres;
+	uint8_t		he_pe_duration;
+	uint8_t	su_disable;
+	uint16_t	max_nss_mcs[CMD_HE_MCS_BW_NUM];
+	uint8_t		rsv[2];
+} __packed;
+
+struct bss_info_uni_bss_color {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		enable;
+	uint8_t		bss_color;
+	uint8_t		rsv[2];
+} __packed;
+
 #define	STA_REC_PHY			0x15
 struct sta_rec_phy {
 	uint16_t	tag;
@@ -1476,6 +1552,33 @@ struct wtbl_rx {
 	uint8_t		rca2;
 	uint8_t		rv;
 	uint8_t		rsv[4];
+} __packed;
+
+#define WTBL_HT 0x02
+struct wtbl_ht {
+	uint16_t tag, len;
+	uint8_t ht, ldpc, af, mm;
+	uint8_t rsv[4];
+} __packed;
+
+#define WTBL_VHT 0x03
+struct wtbl_vht {
+	uint16_t tag, len;
+	uint8_t ldpc, dyn_bw, vht, txop_ps;
+	uint8_t rsv[4];
+} __packed;
+
+#define WTBL_BA 0x08
+#define RST_BA_MAC_TID_MATCH 0
+struct wtbl_ba {
+	uint16_t tag, len;
+	uint8_t tid, ba_type, rsv0[2];
+	uint16_t sn;
+	uint8_t ba_en, ba_winsize_idx;
+	uint16_t ba_winsize;
+	uint8_t peer_addr[IEEE80211_ADDR_LEN];
+	uint8_t rst_ba_tid, rst_ba_sel, rst_ba_sb, band_idx;
+	uint8_t rsv1[4];
 } __packed;
 
 #define	WTBL_HDR_TRANS			0x06

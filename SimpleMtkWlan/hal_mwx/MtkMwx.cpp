@@ -37,6 +37,8 @@
 #include <linux/types.h>
 #include <linux/bitfield.h>
 #include <sys/kpi_mbuf.h>
+#include <IOKit/IOLocks.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <sys/_if_ether.h>
 #include <sys/_if_media.h>
 #include <sys/_malloc.h>
@@ -48,6 +50,10 @@
 #include <FwData.h>
 
 #include "if_mwxreg.h"
+#include "RxAmpduStats.hpp"
+#include "ApCapabilitySummary.hpp"
+#include "RxAmsduMetadata.hpp"
+#include "RxAmsduReassembly.hpp"
 
 OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 
@@ -72,17 +78,21 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #define MWX_PRXV_SGI(v)		(((v) >> 15) & 0x3)
 #define MWX_PRXV_STBC(v)	(((v) >> 22) & 0x3)
 #define MWX_PRXV_TX_MODE(v)	(((v) >> 24) & 0xf)
+#define MWX_HE_RATE_MCS_MASK	0x0f
+#define MWX_HE_RATE_DCM		0x80
 static uint32_t mwx_rxr_mode[16], mwx_rxr_bw[4], mwx_rxr_nss[4], mwx_rxr_mcs[16];
 static uint32_t mwx_rxr_sgi, mwx_rxr_stbc, mwx_rxr_ldpc, mwx_rxr_total;
+static uint32_t mwx_rxr_he_gi[4];
 /* Last unicast RX rate: the firmware does TX rate control and reports none. */
 static int mwx_rxr_last_mcs = -1;
 static uint32_t mwx_rxr_last_kbps;
 
 /* HT/VHT 1SS long GI data rates in 100 kbit/s, by bandwidth and MCS. */
-static const uint16_t mwx_vht_rate[3][10] = {
+static const uint16_t mwx_vht_rate[4][10] = {
 	{ 65, 130, 195, 260, 390, 520, 585, 650, 780, 867 },
 	{ 135, 270, 405, 540, 810, 1080, 1215, 1350, 1620, 1800 },
 	{ 293, 585, 878, 1170, 1755, 2340, 2633, 2925, 3510, 3900 },
+	{ 585, 1170, 1755, 2340, 3510, 4680, 5265, 5850, 7020, 7800 },
 };
 
 static void
@@ -100,14 +110,27 @@ mwx_rx_rate_account(uint32_t v0)
 	}
 	mwx_rxr_nss[(nss - 1) & 3]++;
 	mwx_rxr_mcs[idx & 0xf]++;
-	if (MWX_PRXV_SGI(v0))
+	if (mode >= MT_PHY_TYPE_HE_SU && mode <= MT_PHY_TYPE_HE_MU) {
+		idx &= MWX_HE_RATE_MCS_MASK;
+		mwx_rxr_he_gi[MWX_PRXV_SGI(v0) & 3]++;
+	} else if (MWX_PRXV_SGI(v0))
 		mwx_rxr_sgi++;
 	if (MWX_PRXV_STBC(v0))
 		mwx_rxr_stbc++;
 	if (MWX_PRXV_LDPC(v0))
 		mwx_rxr_ldpc++;
 
-	if (mode >= 2 && mode <= 4 && idx <= 9 && (MWX_PRXV_FRAME_MODE(v0) & 3) < 3) {
+	if (mode >= MT_PHY_TYPE_HE_SU && mode <= MT_PHY_TYPE_HE_MU) {
+		const unsigned bw = MWX_PRXV_FRAME_MODE(v0) & 3;
+		const unsigned rsidx = bw * 2 + (nss > 1 ? 1 : 0);
+		const struct ieee80211_he_rateset *rs =
+		    &ieee80211_std_ratesets_11ax[rsidx];
+		if (idx < rs->nrates) {
+			mwx_rxr_last_kbps = rs->rates[idx] * 100;
+			mwx_rxr_last_mcs = (int)idx;
+		}
+	} else if (mode >= 2 && mode <= 4 && idx <= 9 &&
+	    (MWX_PRXV_FRAME_MODE(v0) & 3) < 4) {
 		uint32_t kbps = mwx_vht_rate[MWX_PRXV_FRAME_MODE(v0) & 3][idx] *
 		    100 * nss;
 		if (MWX_PRXV_SGI(v0))
@@ -415,6 +438,19 @@ struct mwx_queue_data {
 	bus_dmamap_t			md_map;
 };
 
+/*
+ * RX buffers must live below 4GB (Linux mt76 also uses 32-bit DMA), but the
+ * generic mbuf cluster pool hands out pages anywhere in physical memory, so
+ * every RX buffer was bounced through a full-size copy. A pool backed by
+ * IOBufferMemoryDescriptor::inTaskWithPhysicalMask hands out only pages whose
+ * physical addresses fit the mask; attaching them to mbufs as clusters lets
+ * the hardware write the mbuf directly.
+ */
+struct mwx_rx_page {
+	SLIST_ENTRY(mwx_rx_page)	link;
+	uint8_t				*kva;
+};
+
 struct mwx_queue {
 	uint32_t			mq_regbase;
 	u_int				mq_count;
@@ -427,7 +463,19 @@ struct mwx_queue {
 	bus_dmamap_t			mq_map;
 	bus_dma_segment_t		mq_seg;
 	int				mq_wakeme;
+	bool				mq_refill_pending;
+	bool				mq_rx_discard; /* drop a bad chain through LAST */
+	struct mbuf		*mq_rx_head; /* detached DMA buffers, across batches */
+	struct mbuf		*mq_rx_tail;
+	u_int				mq_rx_bytes;
+	u_int				mq_rx_segments;
 };
+
+/* RXD byte count is 16 bits; MCU event len excludes the RXD (up to 32
+ * bytes on connac3). Keep malformed streams bounded without limiting an
+ * otherwise legal MCU response to the 802.11 MPDU limit. */
+#define MWX_RX_CHAIN_MAX_BYTES (UINT16_MAX + 8U * sizeof(uint32_t))
+#define MWX_RX_CHAIN_MAX_SEGS 64U
 
 struct mwx_hw_capa {
 	int8_t		has_2ghz;
@@ -467,6 +515,7 @@ struct mwx_setkey_task_arg {
 struct mwx_softc {
 	struct device		sc_dev;
 	struct ieee80211com	sc_ic;
+	MtkRxAmpduStats		sc_rx_ampdu_stats;
 
 	enum mwx_hw_type	sc_hwtype;
 
@@ -505,8 +554,20 @@ struct mwx_softc {
 	int8_t			sc_resetting;
 	int8_t			sc_hard_reset;	/* reload firmware on reset */
 	int8_t			sc_tx_amsdu;	/* hardware TX A-MSDU (-mtknoamsdu: off) */
+	int8_t			sc_vht160;	/* experimental VHT160 (-mtk160: on) */
+	int8_t			sc_wtbl_ba;
+	int8_t			sc_he_enabled; /* experimental HE (-mtkhe: on) */
+	int8_t			sc_he_only; /* experimental HE-only (-mtkheonly) */	/* hardware BA programming (-mtknowtblba: off) */
 	volatile int8_t		sc_suspended;	/* system sleep: leave the hardware alone */
-	uint32_t		sc_tx_full_cnt;	/* output paused: no TXWI / ring slot */
+	uint32_t		sc_tx_full_cnt;
+	uint32_t		sc_tx_kick_cnt;
+	uint32_t		sc_output_start_cnt;
+	uint32_t		sc_output_noqueue_cnt;
+	uint32_t		sc_output_active_cnt;
+	uint32_t		sc_output_capacity_cnt;
+	uint32_t		sc_output_dequeue_fail_cnt;
+	uint32_t		sc_output_post_active_cnt;
+	uint32_t		sc_output_kick_fail_cnt;	/* output paused: no TXWI / ring slot */
 	int8_t			sc_sta_added;	/* peer STA record exists in fw */
 	bool sc_detaching, sc_net_attached;
 	int8_t			sc_fw_loaded;
@@ -549,6 +610,7 @@ struct mwx_softc {
 		uint32_t	 mcu_int;
 	}			sc_mcu_wait[16];
 	uint8_t			sc_scan_seq_num;
+	uint64_t		sc_last_bgscan_ns;
 
 	/* phy / hw */
 	struct mwx_hw_capa	sc_capa;
@@ -562,6 +624,42 @@ struct mwx_softc {
 	uint32_t		sc_rxfilter;
 
 	/* diagnostic counters, all rate-limited at print sites */
+	uint64_t		sc_rx_dma_bytes;
+	uint64_t		sc_rx_dma_copy_bytes;
+	uint64_t		sc_rx_dma_copy_saved;
+	uint64_t		sc_rx_dma_batches;
+	uint64_t		sc_rx_dma_desc;
+	uint64_t		sc_rx_input_batches;
+	uint64_t		sc_rx_input_packets;
+	uint32_t		sc_rx_input_max_batch;
+	IOLock			*sc_rx_amsdu_lock;
+	IOCommandGate		*sc_rx_amsdu_gate; /* borrowed from the HAL */
+	IOSimpleLock		*sc_rx_pool_lock;
+	IOBufferMemoryDescriptor	*sc_rx_pool_md;
+	uint8_t			*sc_rx_pool_kva;
+	uint8_t			*sc_rx_pool_end;
+	SLIST_HEAD(, mwx_rx_page)	sc_rx_pool_free;
+	struct mwx_rx_page	*sc_rx_pool_pages;
+	uint32_t		sc_rx_pool_total;
+	uint32_t		sc_rx_pool_free_cnt;
+	uint32_t		sc_rx_pool_allocs;
+	uint32_t		sc_rx_pool_exhausted;
+	uint32_t		sc_rx_pool_fallbacks;
+	uint32_t		sc_rx_pool_returned;
+	bool			sc_rx_pool_disabled;
+	uint32_t		sc_rx_amsdu_transition_depth;
+	bool			sc_rx_amsdu_teardown; /* protected by the RX mutex */
+	bool			sc_rx_amsdu_irq_quiesced;
+	MtkRxAmsduState	sc_rx_amsdu_state;
+	uint32_t		sc_rx_amsdu_epoch;
+	bool			sc_rx_amsdu_enabled;
+	uint32_t		sc_rx_dma_max_batch;
+	uint32_t		sc_rx_dma_bad_len;
+	uint64_t		sc_rx_dma_chain_completed;
+	uint64_t		sc_rx_dma_chain_resumed;
+	uint64_t		sc_rx_dma_chain_dropped;
+	uint32_t		sc_rx_refill_fail;
+	uint32_t		sc_rx_refill_recover;
 	uint32_t		sc_rx_process_events;
 	uint32_t		sc_rx_pkt_event;
 	uint32_t		sc_rx_pkt_txrx_notify;
@@ -574,6 +672,231 @@ struct mwx_softc {
 	uint32_t		sc_scan_last_ieee80211_nodes;
 
 };
+
+/* RX executes under the main workloop gate; state/key tasks execute on
+ * thread_call. A transition begins/ends under that same gate, but all MCU
+ * sleeps stay outside it. Nested transitions block only the new aggregate
+ * path. Lock ordering is always gate -> RX mutex, never the reverse. */
+static bool
+mwx_rx_amsdu_tearing_down(struct mwx_softc *sc)
+{
+	if (sc->sc_rx_amsdu_lock == NULL)
+		return false; /* partial attach has no running RX or tasks */
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	const bool teardown = sc->sc_rx_amsdu_teardown;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return teardown;
+}
+
+static bool
+mwx_rx_amsdu_key_cleanup_only(struct mwx_softc *sc)
+{
+	if (sc->sc_rx_amsdu_lock == NULL)
+		return false;
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	const bool cleanup = sc->sc_rx_amsdu_teardown && sc->sc_rx_amsdu_irq_quiesced;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return cleanup;
+}
+
+static void
+mwx_rx_amsdu_purge(struct mwx_softc *sc, int tid = -1, bool invalid = false)
+{
+	if (sc->sc_rx_amsdu_lock == NULL)
+		return;
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	mtkRxAmsduPurge(sc->sc_rx_amsdu_state, tid);
+	if (invalid)
+		++sc->sc_rx_amsdu_state.stats.invalid;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+}
+
+struct MwxRxAmsduBarrier {
+	struct mwx_softc *sc;
+	int operation; /* 0: end, 1: begin, 2: teardown after cancellation */
+	bool finished, accepted;
+};
+
+static IOReturn
+mwx_rx_amsdu_barrier_gated(OSObject *, void *arg, void *, void *, void *)
+{
+	MwxRxAmsduBarrier *barrier = (MwxRxAmsduBarrier *)arg;
+	struct mwx_softc *sc = barrier->sc;
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	barrier->finished = true;
+	barrier->accepted = false;
+	if (barrier->operation == 2) {
+		mtkRxAmsduPurge(sc->sc_rx_amsdu_state);
+		++sc->sc_rx_amsdu_epoch;
+		sc->sc_rx_amsdu_transition_depth = 0;
+		barrier->accepted = true;
+	} else if (!sc->sc_rx_amsdu_teardown) {
+		if (barrier->operation == 1 &&
+		    sc->sc_rx_amsdu_transition_depth != UINT32_MAX) {
+			mtkRxAmsduPurge(sc->sc_rx_amsdu_state);
+			++sc->sc_rx_amsdu_epoch;
+			++sc->sc_rx_amsdu_transition_depth;
+			barrier->accepted = true;
+		} else if (barrier->operation == 0 &&
+		    sc->sc_rx_amsdu_transition_depth != 0) {
+			--sc->sc_rx_amsdu_transition_depth;
+			barrier->accepted = true;
+		}
+	}
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return kIOReturnSuccess;
+}
+
+/* Cancellable acquisition: detach may be waiting for this thread while it
+ * owns the workloop gate. Never block on that gate while holding the mutex.
+ * An unavailable/disabled gate fails closed; its caller must skip the change. */
+static bool
+mwx_rx_amsdu_barrier(struct mwx_softc *sc, int operation)
+{
+	MwxRxAmsduBarrier barrier = { sc, operation, false, false };
+	for (;;) {
+		if (mwx_rx_amsdu_tearing_down(sc) || sc->sc_rx_amsdu_gate == NULL)
+			return false;
+		IOReturn status = sc->sc_rx_amsdu_gate->attemptAction(
+		    mwx_rx_amsdu_barrier_gated, &barrier);
+		if (barrier.finished)
+			return barrier.accepted;
+		if (status != kIOReturnCannotLock)
+			return false;
+		IOSleep(1);
+	}
+}
+
+/* This guard owns only a transition token, never a lock across its scope.
+ * No new task or scheduling queue is introduced. */
+class MwxRxAmsduTransition {
+	struct mwx_softc *sc;
+	bool accepted, owns_token;
+public:
+	explicit MwxRxAmsduTransition(struct mwx_softc *state, bool bypass = false)
+	    : sc(state), accepted(false), owns_token(false)
+	{
+		if (bypass) {
+			accepted = true; /* sole detach owner, after the RX gate barrier */
+			return;
+		}
+		if (mwx_rx_amsdu_tearing_down(sc))
+			return;
+		if (!sc->sc_rx_amsdu_enabled) {
+			accepted = true;
+			return;
+		}
+		accepted = owns_token = mwx_rx_amsdu_barrier(sc, 1);
+	}
+	~MwxRxAmsduTransition()
+	{
+		if (owns_token)
+			(void)mwx_rx_amsdu_barrier(sc, 0);
+	}
+	bool ok() const { return accepted; }
+private:
+	MwxRxAmsduTransition(const MwxRxAmsduTransition &);
+	MwxRxAmsduTransition &operator=(const MwxRxAmsduTransition &);
+};
+
+/* Publish cancellation before waiting for the gate or draining task callbacks.
+ * RX sees teardown immediately; the gate barrier also drains any frame already
+ * executing past the snapshot. Ordinary waiters can now return without the
+ * gate. After IRQ removal final purge/free use only the RX mutex. */
+static void
+mwx_rx_amsdu_begin_teardown(struct mwx_softc *sc)
+{
+	if (sc->sc_rx_amsdu_lock == NULL)
+		return;
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	sc->sc_rx_amsdu_teardown = true;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	if (!sc->sc_rx_amsdu_enabled)
+		return;
+	MwxRxAmsduBarrier barrier = { sc, 2, false, false };
+	if (sc->sc_rx_amsdu_gate == NULL)
+		return; /* partial attach; no interrupt source exists yet */
+	for (;;) {
+		IOReturn status = sc->sc_rx_amsdu_gate->attemptAction(
+		    mwx_rx_amsdu_barrier_gated, &barrier);
+		if (barrier.finished)
+			return;
+		if (status == kIOReturnCannotLock) {
+			IOSleep(1);
+			continue;
+		}
+		/* The command gate can be disabled during stop. Cancellation is
+		 * already visible, so task waiters cannot form a gate/quiesce cycle.
+		 * The public workloop API still serializes this short barrier. */
+		IOWorkLoop *loop = sc->sc_rx_amsdu_gate->getWorkLoop();
+		if (loop != NULL)
+			(void)loop->runAction(mwx_rx_amsdu_barrier_gated, NULL, &barrier);
+		return;
+	}
+}
+
+static void
+mwx_rx_amsdu_invalid(struct mwx_softc *sc)
+{
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	++sc->sc_rx_amsdu_state.stats.invalid;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+}
+
+static bool
+mwx_rx_amsdu_snapshot(struct mwx_softc *sc, uint32_t *epoch)
+{
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	*epoch = sc->sc_rx_amsdu_epoch;
+	const bool accept = !sc->sc_rx_amsdu_teardown &&
+	    sc->sc_rx_amsdu_transition_depth == 0;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return accept;
+}
+
+static uint32_t
+mwx_rx_amsdu_epoch(struct mwx_softc *sc)
+{
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	const uint32_t epoch = sc->sc_rx_amsdu_epoch;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return epoch;
+}
+
+static struct mbuf *
+mwx_rx_amsdu_feed(struct mwx_softc *sc, struct mbuf *m,
+    MtkRxAmsduMeta &meta, uint64_t now_ms, MtkRxAmsduMeta *first)
+{
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	if (sc->sc_rx_amsdu_teardown || sc->sc_rx_amsdu_transition_depth != 0 ||
+	    meta.epoch != sc->sc_rx_amsdu_epoch) {
+		++sc->sc_rx_amsdu_state.stats.mismatch;
+		IOLockUnlock(sc->sc_rx_amsdu_lock);
+		mbuf_freem(m);
+		return NULL;
+	}
+	m = mtkRxAmsduFeed(sc->sc_rx_amsdu_state, m, meta, now_ms, first);
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return m;
+}
+
+static void
+mwx_rx_amsdu_expire(struct mwx_softc *sc, uint64_t now_ms)
+{
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	mtkRxAmsduExpire(sc->sc_rx_amsdu_state, now_ms);
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+}
+
+static MtkRxAmsduStats
+mwx_rx_amsdu_stats(struct mwx_softc *sc)
+{
+	IOLockLock(sc->sc_rx_amsdu_lock);
+	MtkRxAmsduStats stats = sc->sc_rx_amsdu_state.stats;
+	IOLockUnlock(sc->sc_rx_amsdu_lock);
+	return stats;
+}
+
 
 const uint8_t mwx_channels_2ghz[] = {
 	1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
@@ -672,7 +995,9 @@ pkt_hex_dump(struct mbuf *m)
 int	mwx_init(struct ifnet *);
 int	mwx_init_hw(struct ifnet *);
 void	mwx_stop(struct ifnet *);
+static void mwx_stop_internal(struct ifnet *, bool);
 void	mwx_watchdog(struct ifnet *);
+void	mwx_updateedca(struct ieee80211com *);
 void	mwx_start(struct ifnet *);
 int	mwx_ioctl(struct ifnet *, u_long, caddr_t);
 
@@ -696,7 +1021,7 @@ void	mwx_delete_key(struct ieee80211com *, struct ieee80211_node *,
 void	mwx_setkey_task(void *);
 
 int	mwx_tx(struct mwx_softc *, struct mbuf *, struct ieee80211_node *);
-void	mwx_rx(struct mwx_softc *, struct mbuf *, struct mbuf_list *);
+void	mwx_rx(struct mwx_softc *, struct mbuf *, struct mbuf_list *, uint8_t);
 int	mwx_count_nodes(struct ieee80211com *);
 int	mwx_intr(void *);
 int	mwx_preinit(struct mwx_softc *);
@@ -727,10 +1052,14 @@ int	mwx_dma_txwi_enqueue(struct mwx_softc *, struct mwx_queue *,
 	    struct mwx_txwi *);
 void	mwx_dma_tx_cleanup(struct mwx_softc *, struct mwx_queue *);
 void	mwx_dma_tx_done(struct mwx_softc *);
-void	mwx_dma_rx_process(struct mwx_softc *, struct mbuf_list *);
-void	mwx_dma_rx_dequeue(struct mwx_softc *, struct mwx_queue *,
+void	mwx_dma_rx_process(struct mwx_softc *, struct mbuf_list *,
+	    struct mbuf_list *, uint8_t);
+bool	mwx_dma_rx_dequeue(struct mwx_softc *, struct mwx_queue *,
 	    struct mbuf_list *);
-void	mwx_dma_rx_done(struct mwx_softc *, struct mwx_queue *);
+bool	mwx_dma_rx_done(struct mwx_softc *, struct mwx_queue *,
+	    struct mbuf_list *);
+static void	mwx_add_sta_he_tlvs(struct mbuf *, uint16_t *,
+	    struct ieee80211_node *);
 
 struct mbuf	*mwx_mcu_alloc_msg(size_t);
 void	mwx_mcu_set_len(struct mbuf *, void *);
@@ -1096,11 +1425,22 @@ mwx_init_hw(struct ifnet *ifp)
 void
 mwx_stop(struct ifnet *ifp)
 {
+	mwx_stop_internal(ifp, false);
+}
+
+static void
+mwx_stop_internal(struct ifnet *ifp, bool teardown_owner)
+{
 	struct mwx_softc *sc = (struct mwx_softc *)ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
 	int s = splnet();
 	int was_running = (ifp->if_flags & IFF_RUNNING) != 0;
 
+	MwxRxAmsduTransition transition(sc, teardown_owner);
+	if (!transition.ok()) {
+		splx(s);
+		return;
+	}
 	DPRINTF("%s: stop\n", DEVNAME(sc));
 
 	/*
@@ -1147,7 +1487,10 @@ mwx_stop(struct ifnet *ifp)
 		mt7921_mcu_set_mac_enable(sc, 0, 0);
 	}
 
-	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
+	/* Detach defers software key cleanup until its IRQ source is removed.
+	 * Group-key cleanup zeroes each key immediately after delete_key returns. */
+	if (!teardown_owner)
+		sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
 	sc->sc_ns_state = IEEE80211_S_INIT;
 	ifp->if_timer = 0;
 
@@ -1188,8 +1531,9 @@ mwx_tx_kick(struct mwx_softc *sc)
 {
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
 
-	if (!ifq_is_oactive(&ifp->if_snd) || !mwx_tx_has_room(sc, 32))
+	if (!ifq_is_oactive(&ifp->if_snd) || !mwx_tx_has_room(sc, 1))
 		return;
+	sc->sc_tx_kick_cnt++;
 	ifq_clr_oactive(&ifp->if_snd);
 	mwx_start(ifp);
 #ifdef __PRIVATE_SPI__
@@ -1472,6 +1816,11 @@ mwx_newstate_task(void *ptr)
 	int s = splnet();
 	int rv = 0;
 
+	MwxRxAmsduTransition transition(sc);
+	if (!transition.ok()) {
+		splx(s);
+		return;
+	}
 	switch (ostate) {
 	case IEEE80211_S_RUN:
 		if (nstate != ostate)
@@ -1557,6 +1906,14 @@ mwx_newstate_task(void *ptr)
 		mwx_mcu_set_deep_sleep(sc, 0);
 		{
 			struct ieee80211_node *bni = ic->ic_bss;
+			MtkApCapabilitySummary raw = {};
+			const bool cache_valid = mtkParseApCapabilities(
+			    bni->ni_rsnie_tlv, bni->ni_rsnie_tlv_len, raw);
+			MWX_DEV_LOG(sc,
+			    "AP raw-cache valid=%d bytes=%u vht=%d caps=0x%08x operation=%d width=%u center0=%u center1=%u he_cap_bytes=%u node_chan2=%u\n",
+			    cache_valid, bni->ni_rsnie_tlv_len, raw.vht, raw.vhtCaps,
+			    raw.operation, raw.width, raw.center0, raw.center1,
+			    raw.heCapabilityBytes, bni->ni_vht_chan2);
 			MWX_DEV_LOG(sc,
 			    "RUN peer ht=%d vht=%d chw=%d vht_chanwidth=%u vht_chan1=%u center_freq1=%u htcaps=0x%04x vhtcaps=0x%08x\n",
 			    !!(bni->ni_flags & IEEE80211_NODE_HT),
@@ -1576,6 +1933,9 @@ mwx_newstate_task(void *ptr)
 		rv = mt7921_mcu_set_associated_bss(sc, 1);
 		if (!rv)
 			rv = mt7921_mcu_set_associated_peer(sc);
+		/* WMM must be programmed after BSS_INFO enables TXCMD mode. */
+		if (!rv)
+			rv = mt7921_mcu_set_tx(sc, &sc->sc_vif);
 		if (rv)
 			break;
 		mt7921_mcu_set_rts_thresh(sc, 0x92b, 0);
@@ -1593,6 +1953,7 @@ int
 mwx_bgscan(struct ieee80211com *ic)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	uint64_t now_ns = 0;
 	int err;
 
 	if (sc->sc_flags & MWX_FLAG_SCANNING)
@@ -1605,8 +1966,7 @@ mwx_bgscan(struct ieee80211com *ic)
 	 * one background scan per 2 minutes while in RUN.
 	 */
 	if (ic->ic_state == IEEE80211_S_RUN) {
-		static uint64_t last_bgscan_ns;
-		uint64_t now_ns, min_ns = 120ULL * 1000000000ULL;
+		uint64_t min_ns = 120ULL * 1000000000ULL;
 
 #ifdef AIRPORT_WCL
 		/*
@@ -1617,9 +1977,9 @@ mwx_bgscan(struct ieee80211com *ic)
 			min_ns = 10ULL * 1000000000ULL;
 #endif
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
-		if (last_bgscan_ns != 0 && now_ns - last_bgscan_ns < min_ns)
+		if (sc->sc_last_bgscan_ns != 0 &&
+		    now_ns - sc->sc_last_bgscan_ns < min_ns)
 			return EBUSY;
-		last_bgscan_ns = now_ns;
 	}
 
 	err = mt7921_mcu_hw_scan(sc, 1);
@@ -1628,6 +1988,9 @@ mwx_bgscan(struct ieee80211com *ic)
 		return err;
 	}
 
+	/* Failed submissions must remain immediately retryable, per adapter. */
+	if (now_ns != 0)
+		sc->sc_last_bgscan_ns = now_ns;
 	sc->sc_flags |= MWX_FLAG_BGSCAN;
 	return 0;
 }
@@ -1653,6 +2016,15 @@ mwx_bgscan_done_task(void *arg)
 	int err = 0;
 	int s = splnet();
 
+#ifdef AIRPORT_WCL
+	/* A WCL lock can arrive while this automatic BSS switch is queued. */
+	if (ic->ic_state == IEEE80211_S_RUN && ic->ic_wcl_roam_locked) {
+		ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+		ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
+		err = EBUSY;
+		goto done;
+	}
+#endif
 	if (ic->ic_state != IEEE80211_S_RUN ||
 	    (ic->ic_flags & IEEE80211_F_BGSCAN) == 0) {
 		err = ENXIO;
@@ -1770,6 +2142,15 @@ mwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	DPRINTF("%s: delete_key: ni %p, k_id %d, k_flags %x k_cipher %d\n",
 	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
 
+	MwxRxAmsduTransition transition(sc);
+	if (!transition.ok()) {
+		/* Only final ifdetach cleanup, after interrupts were removed, may
+		 * release software keys following canceled transition acquisition. */
+		if (mwx_rx_amsdu_key_cleanup_only(sc) &&
+		    (k->k_flags & IEEE80211_KEY_SWCRYPTO))
+			ieee80211_delete_key(ic, ni, k);
+		return;
+	}
 	mt7921_mcu_sta_key_delete(sc, ni, k);
 	/* release the software crypto context set up in mwx_set_key() */
 	if (k->k_flags & IEEE80211_KEY_SWCRYPTO)
@@ -1784,6 +2165,11 @@ mwx_setkey_task(void *arg)
 	int s = splnet();
 
 	while (sc->sc_setkey_tail != sc->sc_setkey_cur) {
+		MwxRxAmsduTransition transition(sc);
+		if (!transition.ok()) {
+			splx(s);
+			return;
+		}
 		a = &sc->sc_setkey_arg[sc->sc_setkey_tail];
 		mt7921_mcu_sta_key_update(sc, a->ni, a->k);
 		a->ni = NULL;
@@ -1927,17 +2313,45 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 }
 
 void
-mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
+mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxqueue)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
 	struct ieee80211_node *ni;
 	struct ieee80211_frame *wh;
 	struct ieee80211_rxinfo rxi = { 0 };
-	int rv;
+	MtkRxDescriptorMeta descriptor = {};
+	int aggregate = 0, rv;
+	uint32_t rx_epoch = 0;
 
+	/* Opt-in until hardware-format and throughput validation is complete. */
+	if (sc->sc_rx_amsdu_enabled) {
+		aggregate = mtkRxAmsduReadDescriptor(m, descriptor);
+		if (aggregate != 0 && !mwx_rx_amsdu_snapshot(sc, &rx_epoch)) {
+			m_freem(m);
+			return;
+		}
+		static uint32_t rx_amsdu_descriptor_logs;
+		if (aggregate != 0 && rx_amsdu_descriptor_logs < 8) {
+			MWX_DEV_LOG(sc,
+			    "rxamsdu descriptor queue=%u result=%d format=%u wcid=%u cipher=%u key=%u pn_valid=%d protected=%d len=%zu hdrgap=%u hdrlen=%u\n",
+			    rxqueue, aggregate, descriptor.format, descriptor.wcid,
+			    descriptor.cipher, descriptor.key, descriptor.pn_valid,
+			    descriptor.protected_frame, mbuf_len(m), descriptor.hdr_gap,
+			    descriptor.hdrlen);
+			rx_amsdu_descriptor_logs++;
+		}
+		if (aggregate < 0) {
+			mwx_rx_amsdu_purge(sc, -1, true);
+			ifp->if_ierrors++;
+			m_freem(m);
+			return;
+		}
+	}
 	rv = mt7921_mac_fill_rx(sc, m, &rxi);
 	if (rv != 0) {
+		if (aggregate)
+			mwx_rx_amsdu_purge(sc);
 		if (sc->sc_rx_fill_fail < 32) {
 			MWX_DEV_LOG(sc,
 			    "rx fill failed rv=%d len=%zu fail_count=%u\n",
@@ -1947,6 +2361,63 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		ifp->if_ierrors++;
 		m_freem(m);
 		return;
+	}
+
+	if (aggregate) {
+		if (!mtkRxAmsduRemovePad(m, descriptor)) {
+			mwx_rx_amsdu_purge(sc, -1, true);
+			ifp->if_ierrors++;
+			m_freem(m);
+			return;
+		}
+		/* fill_rx cleared Protected after hardware decryption. Retain the
+		 * authenticated crypto context while collecting hardware subframes. */
+		if (descriptor.protected_frame)
+			((uint8_t *)mbuf_data(m))[1] |= IEEE80211_FC1_PROTECTED;
+		MtkRxAmsduMeta meta = {}, first = {};
+		meta.epoch = rx_epoch;
+		meta.queue = rxqueue;
+		meta.wcid = descriptor.wcid;
+		meta.seqctl = descriptor.seqctl;
+		meta.tid = descriptor.tid;
+		meta.cipher = descriptor.cipher;
+		meta.key = descriptor.key;
+		meta.format = descriptor.format;
+		meta.hdrlen = descriptor.hdrlen;
+		meta.protected_frame = descriptor.protected_frame;
+		meta.hwdec = descriptor.hwdec;
+		meta.pn_valid = descriptor.pn_valid;
+		memcpy(meta.pn, descriptor.pn, sizeof(meta.pn));
+		meta.rxi = rxi;
+		uint64_t now_ns = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+		m = mwx_rx_amsdu_feed(sc, m, meta, now_ns / 1000000, &first);
+		if (m == NULL)
+			return;
+		descriptor.wcid = first.wcid;
+		descriptor.seqctl = first.seqctl;
+		descriptor.tid = first.tid;
+		descriptor.cipher = first.cipher;
+		descriptor.key = first.key;
+		descriptor.format = first.format;
+		descriptor.hdrlen = first.hdrlen;
+		descriptor.protected_frame = first.protected_frame;
+		descriptor.hwdec = first.hwdec;
+		descriptor.pn_valid = first.pn_valid;
+		memcpy(descriptor.pn, first.pn, sizeof(descriptor.pn));
+		rxi = first.rxi;
+		if (first.epoch != mwx_rx_amsdu_epoch(sc)) {
+			m_freem(m);
+			return;
+		}
+		/* Restore exactly one IV. net80211 validates PN after BA reorder
+		 * and removes this IV; the hardware already removed the MIC. */
+		m = mtkRxAmsduRestoreCcmp(m, descriptor);
+		if (m == NULL) {
+			mwx_rx_amsdu_invalid(sc);
+			ifp->if_ierrors++;
+			return;
+		}
 	}
 
 	wh = mtod(m, struct ieee80211_frame *);
@@ -2039,6 +2510,7 @@ int
 mwx_intr(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct mbuf_list mlout = MBUF_LIST_INITIALIZER();
 	uint32_t intr, intr_sw;
 	uint32_t mask = sc->sc_intr_mask;
 	static uint32_t intr_log_count;
@@ -2091,16 +2563,17 @@ mwx_intr(void *arg)
 			intr |= MT_INT_RX_DONE_DATA;
 	}
 
+	bool rx_more = false;
 	for (int pass = 0; ; pass++) {
 		if (intr & MT_INT_TX_DONE_ALL)
 			mwx_dma_tx_done(sc);
 
 		if (intr & MT_INT_RX_DONE_WM)
-			mwx_dma_rx_done(sc, &sc->sc_rxfwdlq);
+			rx_more |= mwx_dma_rx_done(sc, &sc->sc_rxfwdlq, &mlout);
 		if (intr & MT_INT_RX_DONE_WM2)
-			mwx_dma_rx_done(sc, &sc->sc_rxmcuq);
+			rx_more |= mwx_dma_rx_done(sc, &sc->sc_rxmcuq, &mlout);
 		if (intr & MT_INT_RX_DONE_DATA)
-			mwx_dma_rx_done(sc, &sc->sc_rxq);
+			rx_more |= mwx_dma_rx_done(sc, &sc->sc_rxq, &mlout);
 
 		/*
 		 * MSI is edge triggered: events that arrived while the host
@@ -2121,12 +2594,135 @@ mwx_intr(void *arg)
 		}
 	}
 
+	/* Deliver one data batch across all RX queues and drain passes. MCU
+	 * events and management frames were processed immediately above. */
+	if (!ml_empty(&mlout)) {
+		const u_int packets = ml_len(&mlout);
+		sc->sc_rx_input_batches++;
+		sc->sc_rx_input_packets += packets;
+		if (packets > sc->sc_rx_input_max_batch)
+			sc->sc_rx_input_max_batch = packets;
+		if_input(&sc->sc_ic.ic_if, &mlout);
+	}
+
 	/* TODO power management */
 //	mt76_connac_pm_unref(&dev->mphy, &dev->pm);
 
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
+	if (rx_more)
+		pci_intr_reschedule(sc->sc_pc, sc->sc_ih);
 
 	return 1;
+}
+
+static void
+mwx_init_he_caps(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_he_cap_elem *cap = &ic->ic_he_cap_elem;
+	struct ieee80211_he_mcs_nss_supp *mcs = &ic->ic_he_mcs_nss_supp;
+	const unsigned nss = sc->sc_capa.num_streams > 1 ? 2 : 1;
+	uint16_t map = 0;
+
+	memset(cap, 0, sizeof(*cap));
+	memset(mcs, 0, sizeof(*mcs));
+	memset(ic->ic_ppe_thres, 0, sizeof(ic->ic_ppe_thres));
+
+	for (unsigned i = 0; i < 8; i++) {
+		const unsigned support = i < nss ?
+		    IEEE80211_HE_MCS_SUPPORT_0_11 : IEEE80211_HE_MCS_NOT_SUPPORTED;
+		map |= support << (i * 2);
+	}
+
+	cap->mac_cap_info[0] = IEEE80211_HE_MAC_CAP0_HTC_HE;
+	cap->mac_cap_info[1] = IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_16US;
+	cap->mac_cap_info[3] = IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
+	    IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_VHT_2;
+	cap->mac_cap_info[4] = IEEE80211_HE_MAC_CAP4_AMDSU_IN_AMPDU;
+	cap->phy_cap_info[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD |
+	    IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A |
+	    IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US;
+	cap->phy_cap_info[2] |= IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US;
+	if (sc->sc_capa.has_2ghz) {
+		cap->phy_cap_info[0] |=
+		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
+		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_2G;
+		cap->phy_cap_info[8] |=
+		    IEEE80211_HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_IN_2G;
+	}
+	if (sc->sc_capa.has_5ghz) {
+		cap->phy_cap_info[0] |=
+		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
+		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_5G;
+		if (sc->sc_vht160)
+			cap->phy_cap_info[0] |=
+			    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+	}
+
+	/* Match the Linux mt7921/7922 station HE PHY advertisement. */
+	cap->phy_cap_info[3] |=
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_QPSK |
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_TX_NSS_2 |
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_QPSK |
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_RX_NSS_2;
+	cap->phy_cap_info[4] |=
+	    IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
+	    IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_4;
+	cap->phy_cap_info[5] |=
+	    IEEE80211_HE_PHY_CAP5_NG16_SU_FEEDBACK |
+	    IEEE80211_HE_PHY_CAP5_NG16_MU_FEEDBACK;
+	cap->phy_cap_info[6] |=
+	    IEEE80211_HE_PHY_CAP6_CODEBOOK_SIZE_42_SU |
+	    IEEE80211_HE_PHY_CAP6_CODEBOOK_SIZE_75_MU |
+	    IEEE80211_HE_PHY_CAP6_TRIG_CQI_FB |
+	    IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE;
+	cap->phy_cap_info[7] |=
+	    IEEE80211_HE_PHY_CAP7_POWER_BOOST_FACTOR_AR |
+	    IEEE80211_HE_PHY_CAP7_HE_SU_MU_PPDU_4XLTF_AND_08_US_GI;
+	cap->phy_cap_info[8] |= IEEE80211_HE_PHY_CAP8_DCM_MAX_RU_484;
+	cap->phy_cap_info[9] |=
+	    IEEE80211_HE_PHY_CAP9_LONGER_THAN_16_SIGB_OFDM_SYM |
+	    IEEE80211_HE_PHY_CAP9_NON_TRIGGERED_CQI_FEEDBACK |
+	    IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU |
+	    IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU |
+	    IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_COMP_SIGB |
+	    IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_NON_COMP_SIGB;
+	if (sc->sc_vht160) {
+		cap->phy_cap_info[4] |=
+		    IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_4;
+		cap->phy_cap_info[8] |=
+		    IEEE80211_HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU |
+		    IEEE80211_HE_PHY_CAP8_80MHZ_IN_160MHZ_HE_PPDU;
+	}
+
+	cap->phy_cap_info[6] |=
+	    IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT;
+	{
+		static const uint8_t ppet16_ppet8_ru3_ru0[] = {
+		    0x1c, 0xc7, 0x71
+		};
+		const uint8_t ru_mask = sc->sc_capa.has_5ghz ? 0x0f : 0x03;
+		const unsigned ru_count = hweight8(ru_mask);
+		const unsigned ppet_bits = IEEE80211_PPE_THRES_INFO_PPET_SIZE *
+		    nss * ru_count * 2;
+		const unsigned ppet_size = (ppet_bits + 7) / 8;
+
+		ic->ic_ppe_thres[0] = ((nss - 1) <<
+		    IEEE80211_PPE_THRES_NSS_POS) |
+		    (ru_mask << IEEE80211_PPE_THRES_RU_INDEX_BITMASK_POS);
+		for (unsigned i = 0; i < ppet_size; i++)
+			ic->ic_ppe_thres[i + 1] =
+			    ppet16_ppet8_ru3_ru0[i % 3];
+		ic->ic_ppe_thres[ppet_size] &=
+		    0xff >> (8 - (ppet_bits - 1) % 8);
+	}
+
+	mcs->rx_mcs_80 = htole16(map);
+	mcs->tx_mcs_80 = htole16(map);
+	if (sc->sc_vht160) {
+		mcs->rx_mcs_160 = htole16(map);
+		mcs->tx_mcs_160 = htole16(map);
+	}
 }
 
 int
@@ -2185,7 +2781,8 @@ mwx_preinit(struct mwx_softc *sc)
 			ic->ic_channels[chan].ic_flags = IEEE80211_CHAN_A |
 			    IEEE80211_CHAN_HT20 | IEEE80211_CHAN_HT40 |
 			    IEEE80211_CHAN_VHT20 |
-			    IEEE80211_CHAN_VHT40 | IEEE80211_CHAN_VHT80;
+			    IEEE80211_CHAN_VHT40 | IEEE80211_CHAN_VHT80 |
+			    (sc->sc_vht160 ? IEEE80211_CHAN_VHT160 : 0);
 		}
 	}
 #ifdef NOTYET
@@ -2203,11 +2800,25 @@ mwx_preinit(struct mwx_softc *sc)
 		ic->ic_sup_mcs[1] = 0xff;
 	ic->ic_tx_mcs_set = IEEE80211_TX_MCS_SET_DEFINED;
 
+	{
+		int on = 0;
+		sc->sc_he_enabled = PE_parse_boot_argn("-mtkhe", &on,
+		    sizeof(on)) && sc->sc_hwtype == MWX_HW_MT7922;
+	}	{
+		int only = 0;
+		sc->sc_he_only = sc->sc_he_enabled &&
+		    PE_parse_boot_argn("-mtkheonly", &only, sizeof(only));
+	}
+	mwx_init_he_caps(sc);
 	/* Configure channel information obtained from firmware. */
 	ieee80211_channel_init(ifp);
-	/* VHT channels make net80211 claim 11ax too; HE is not supported. */
-	ic->ic_modecaps &= ~(1 << IEEE80211_MODE_11AX);
-	MWX_DEV_LOG(sc, "preinit channel table ready\n");
+	if (sc->sc_he_enabled)
+		ic->ic_modecaps |= 1 << IEEE80211_MODE_11AX;
+	else
+		ic->ic_modecaps &= ~(1 << IEEE80211_MODE_11AX);
+	MWX_DEV_LOG(sc, "preinit channel table ready vht160=%d wtbl_ba=%d he=%d heonly=%d\n",
+	    sc->sc_vht160, sc->sc_wtbl_ba, sc->sc_he_enabled,
+	    sc->sc_he_only);
 
 	if (IEEE80211_ADDR_EQ(etheranyaddr, sc->sc_ic.ic_myaddr))
 		IEEE80211_ADDR_COPY(ic->ic_myaddr, sc->sc_lladdr);
@@ -2227,10 +2838,15 @@ mwx_preinit(struct mwx_softc *sc)
 	 * so together with TX A-MPDU, which the driver does not support yet.
 	 */
 	ic->ic_flags |= IEEE80211_F_QOS;
-	/* media_init does not turn VHT on by itself; never enable HE. */
-	ic->ic_flags &= ~IEEE80211_F_HEON;
-	if (ic->ic_modecaps & (1 << IEEE80211_MODE_11AC))
+	if (sc->sc_he_enabled)
+		ic->ic_flags |= IEEE80211_F_HEON;
+	else
+		ic->ic_flags &= ~IEEE80211_F_HEON;
+	if ((ic->ic_modecaps & (1 << IEEE80211_MODE_11AC)) &&
+	    !sc->sc_he_only)
 		ic->ic_flags |= IEEE80211_F_VHTON;
+	else
+		ic->ic_flags &= ~IEEE80211_F_VHTON;
 	MWX_DEV_LOG(sc, "preinit 11n htcaps=0x%04x mcs=%02x%02x hton=%d qos=%d vhton=%d vhtcaps=0x%08x\n",
 	    ic->ic_htcaps, ic->ic_sup_mcs[1], ic->ic_sup_mcs[0],
 	    !!(ic->ic_flags & IEEE80211_F_HTON),
@@ -2279,6 +2895,15 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		sc->sc_hwtype = MWX_HW_MT7921;
 	MWX_DEV_LOG(sc, "attach hardware type=%s\n",
 	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	/* Resolve this before advertising VHT capabilities, not in preinit. */
+	{
+		int flag = 0;
+		sc->sc_vht160 = sc->sc_hwtype == MWX_HW_MT7922 &&
+		    PE_parse_boot_argn("-mtk160", &flag, sizeof(flag)) &&
+		    !PE_parse_boot_argn("-mtkno160", &flag, sizeof(flag));
+		sc->sc_wtbl_ba = !PE_parse_boot_argn("-mtknowtblba", &flag,
+		    sizeof(flag));
+	}
 
 	memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, PCI_MAPREG_START);
 	if (pci_mapreg_map(pa, PCI_MAPREG_START, memtype, 0,
@@ -2393,6 +3018,15 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    IEEE80211_C_QOS |		/* WMM, required for 11n */
 	    IEEE80211_C_TX_AMPDU;	/* TX A-MPDU, BA set up in firmware */
 
+	{
+		int on = 0;
+		sc->sc_rx_amsdu_enabled = PE_parse_boot_argn("-mtkrxamsdu", &on, sizeof(on));
+		if (sc->sc_rx_amsdu_enabled)
+			ic->ic_caps |= IEEE80211_C_AMSDU_IN_AMPDU;
+		MWX_DEV_LOG(sc, "RX A-MSDU reassembly enabled=%d max_body=3839\n",
+		    sc->sc_rx_amsdu_enabled);
+	}
+
 	/*
 	 * Hardware TX A-MSDU (MT_TXD7_HW_AMSDU), like Linux mt7921 and
 	 * pengubow's MT7922 port: the MAC packs several MSDUs of a TID with a
@@ -2443,6 +3077,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    (3U << IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT) |
 	    IEEE80211_VHTCAP_RX_ANTENNA_PATTERN |
 	    IEEE80211_VHTCAP_TX_ANTENNA_PATTERN;
+	if (sc->sc_vht160)
+		ic->ic_vhtcaps |= IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_160MHZ |
+		    IEEE80211_VHTCAP_SHORT_GI_160;
 	/* 2 bits per NSS: 2 = MCS 0-9, 3 = not supported */
 	ic->ic_vht_rx_mcs_map = 0xfffa;
 	ic->ic_vht_tx_mcs_map = 0xfffa;
@@ -2486,6 +3123,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	ic->ic_node_alloc = mwx_node_alloc;
 	ic->ic_newassoc = mwx_newassoc;
+	ic->ic_updateedca = mwx_updateedca;
 #ifndef IEEE80211_STA_ONLY
 	ic->ic_node_leave = mwx_node_leave;
 #endif
@@ -2904,6 +3542,10 @@ fail:
 void
 mwx_queue_free(struct mwx_softc *sc, struct mwx_queue *q)
 {
+	/* A partial frame no longer belongs to any ring slot. */
+	m_freem(q->mq_rx_head);
+	q->mq_rx_head = q->mq_rx_tail = NULL;
+	q->mq_rx_bytes = q->mq_rx_segments = 0;
 	if (q->mq_data != NULL) {
 		int i;
 		for (i = 0; i < q->mq_count; i++) {
@@ -2940,6 +3582,11 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 	uint32_t dmaaddr;
 	struct mwx_queue_data *md;
 
+	/* Reset must release detached fragments as well as posted buffers. */
+	m_freem(q->mq_rx_head);
+	q->mq_rx_head = q->mq_rx_tail = NULL;
+	q->mq_rx_bytes = q->mq_rx_segments = 0;
+
 	/* clear descriptors */
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	    BUS_DMASYNC_PREWRITE);
@@ -2964,6 +3611,8 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 	mwx_write(sc, q->mq_regbase + MT_DMA_DMA_IDX, 0);
 	q->mq_cons = 0;
 	q->mq_prod = 0;
+	q->mq_refill_pending = false;
+	q->mq_rx_discard = false;
 
 	/* free buffers */
 	for (i = 0; i < q->mq_count; i++) {
@@ -2984,14 +3633,178 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 	}
 }
 
+/*
+ * Page pool for DMA-safe RX buffers. All pages come from one allocation
+ * whose physical addresses satisfy the device's 32-bit mask, so RX DMA
+ * writes the mbuf cluster directly and the bounce copy disappears.
+ * mwx_buf_fill runs on the interrupt/workloop thread; the free callback
+ * can run on any thread, hence the simple lock.
+ */
+#define MWX_RX_POOL_PAGES	16384	/* 64 MiB / 4 KiB */
+#define MWX_RX_POOL_MASK	0x00000000ffffffffULL
+
+static void
+mwx_rx_pool_free_page(caddr_t addr, u_int size, caddr_t arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct mwx_rx_page *page = NULL;
+
+	if (sc == NULL || sc->sc_rx_pool_pages == NULL)
+		return;
+	/* The mbuf hands back the page start; locate the page arithmetically. */
+	const uint64_t offset = (uint64_t)((uint8_t *)addr - sc->sc_rx_pool_kva);
+	if (offset <= (uint64_t)(sc->sc_rx_pool_end - sc->sc_rx_pool_kva) &&
+	    (offset & (PAGE_SIZE - 1)) == 0 &&
+	    (offset >> PAGE_SHIFT) < sc->sc_rx_pool_total)
+		page = &sc->sc_rx_pool_pages[offset >> PAGE_SHIFT];
+	if (page == NULL)
+		return;
+	IOSimpleLockLock(sc->sc_rx_pool_lock);
+	SLIST_INSERT_HEAD(&sc->sc_rx_pool_free, page, link);
+	sc->sc_rx_pool_free_cnt++;
+	sc->sc_rx_pool_returned++;
+	IOSimpleLockUnlock(sc->sc_rx_pool_lock);
+	(void)size;
+}
+
+static void
+mwx_rx_pool_free(struct mwx_softc *sc)
+{
+	/* Pages and the page array live in/from the descriptor memory. */
+	if (sc->sc_rx_pool_md != NULL) {
+		sc->sc_rx_pool_md->release();
+		sc->sc_rx_pool_md = NULL;
+	}
+	if (sc->sc_rx_pool_pages != NULL) {
+		mwx_free_mem(sc->sc_rx_pool_pages);
+		sc->sc_rx_pool_pages = NULL;
+	}
+	SLIST_INIT(&sc->sc_rx_pool_free);
+	sc->sc_rx_pool_kva = NULL;
+	sc->sc_rx_pool_end = NULL;
+	sc->sc_rx_pool_total = 0;
+	sc->sc_rx_pool_free_cnt = 0;
+}
+
+/* Physical address of a pool page: the descriptor reports each page's bus
+ * address, which equals the physical address on this platform (no IOMMU
+ * translation for the pool's own mapping). */
+static uint32_t
+mwx_rx_pool_page_phys(struct mwx_softc *sc, uint8_t *kva)
+{
+	uint32_t offset = (uint32_t)(kva - sc->sc_rx_pool_kva);
+	IOByteCount remaining = 0;
+	/* kIOMemoryMapperNone yields the host physical address directly. */
+	addr64_t seg = sc->sc_rx_pool_md->getPhysicalSegment(offset,
+	    &remaining, kIOMemoryMapperNone);
+	return (uint32_t)seg;
+}
+
+static int
+mwx_rx_pool_alloc(struct mwx_softc *sc)
+{
+	int off = 0;
+
+	sc->sc_rx_pool_md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+	    kernel_task, kIODirectionIn, MWX_RX_POOL_PAGES * PAGE_SIZE,
+	    MWX_RX_POOL_MASK);
+	if (sc->sc_rx_pool_md == NULL)
+		return ENOMEM;
+	sc->sc_rx_pool_kva = (uint8_t *)sc->sc_rx_pool_md->getBytesNoCopy();
+	if (sc->sc_rx_pool_kva == NULL) {
+		mwx_rx_pool_free(sc);
+		return ENOMEM;
+	}
+	sc->sc_rx_pool_end = sc->sc_rx_pool_kva + MWX_RX_POOL_PAGES * PAGE_SIZE;
+	sc->sc_rx_pool_pages = (struct mwx_rx_page *)mallocarray(
+	    MWX_RX_POOL_PAGES, sizeof(struct mwx_rx_page), M_DEVBUF,
+	    M_NOWAIT | M_ZERO);
+	if (sc->sc_rx_pool_pages == NULL) {
+		mwx_rx_pool_free(sc);
+		return ENOMEM;
+	}
+	sc->sc_rx_pool_total = MWX_RX_POOL_PAGES;
+	for (uint32_t i = 0; i < MWX_RX_POOL_PAGES; i++) {
+		sc->sc_rx_pool_pages[i].kva =
+		    sc->sc_rx_pool_kva + (off + i) * PAGE_SIZE;
+		SLIST_INSERT_HEAD(&sc->sc_rx_pool_free,
+		    &sc->sc_rx_pool_pages[i], link);
+	}
+	sc->sc_rx_pool_free_cnt = MWX_RX_POOL_PAGES;
+	return 0;
+}
+
 int
 mwx_buf_fill(struct mwx_softc *sc, struct mwx_queue_data *md,
     struct mwx_desc *desc)
 {
-	struct mbuf *m;
+	struct mbuf *m = NULL;
+	struct mwx_rx_page *page = NULL;
 	uint32_t buf0, len0, ctrl;
 	int rv;
 
+	/* Never overwrite a slot whose buffer is still owned by the ring. */
+	if (md->md_mbuf != NULL)
+		return EBUSY;
+
+	/* Prefer a DMA-safe pool page: no bounce copy on completion. */
+	if (!sc->sc_rx_pool_disabled && sc->sc_rx_pool_lock != NULL &&
+	    sc->sc_rx_pool_kva != NULL) {
+		IOSimpleLockLock(sc->sc_rx_pool_lock);
+		page = SLIST_FIRST(&sc->sc_rx_pool_free);
+		if (page != NULL) {
+			SLIST_REMOVE_HEAD(&sc->sc_rx_pool_free, link);
+			sc->sc_rx_pool_free_cnt--;
+		}
+		IOSimpleLockUnlock(sc->sc_rx_pool_lock);
+		sc->sc_rx_pool_allocs++;
+		if (page == NULL)
+			sc->sc_rx_pool_exhausted++;
+	}
+
+	if (page != NULL) {
+		if (mbuf_gethdr(M_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
+			IOSimpleLockLock(sc->sc_rx_pool_lock);
+			SLIST_INSERT_HEAD(&sc->sc_rx_pool_free, page, link);
+			sc->sc_rx_pool_free_cnt++;
+			IOSimpleLockUnlock(sc->sc_rx_pool_lock);
+			return ENOMEM;
+		}
+		if (mbuf_attachcluster(M_DONTWAIT, MBUF_TYPE_DATA, &m,
+		    (caddr_t)page->kva, mwx_rx_pool_free_page, PAGE_SIZE,
+		    (caddr_t)sc) != 0) {
+			mbuf_free(m);
+			IOSimpleLockLock(sc->sc_rx_pool_lock);
+			SLIST_INSERT_HEAD(&sc->sc_rx_pool_free, page, link);
+			sc->sc_rx_pool_free_cnt++;
+			IOSimpleLockUnlock(sc->sc_rx_pool_lock);
+			return ENOMEM;
+		}
+		/* The RXD lives at the buffer start; keep the full page. */
+		mbuf_setlen(m, MT_RX_BUF_SIZE);
+		mbuf_pkthdr_setlen(m, MT_RX_BUF_SIZE);
+		md->md_mbuf = m;
+		buf0 = mwx_rx_pool_page_phys(sc, page->kva);
+		/* No load was performed for pool pages; publish the segment
+		 * metadata the RX completion path validates against. */
+		md->md_map->dm_mbuf = m;
+		md->md_map->dm_bounce = false;
+		md->md_map->dm_nsegs = 1;
+		md->md_map->dm_mapsize = PAGE_SIZE;
+		md->md_map->dm_segs[0].ds_addr = buf0;
+		md->md_map->dm_segs[0].ds_len = MT_RX_BUF_SIZE;
+
+		len0 = MT_RX_BUF_SIZE;
+		ctrl = MT_DMA_CTL_SD_LEN0(len0);
+		ctrl |= MT_DMA_CTL_LAST_SEC0;
+		desc->buf0 = htole32(buf0);
+		desc->buf1 = 0;
+		desc->info = 0;
+		desc->ctrl = htole32(ctrl);
+		return 0;
+	}
+
+	sc->sc_rx_pool_fallbacks++;
 	m = MCLGETL(NULL, M_DONTWAIT, MT_RX_BUF_SIZE);
 	if (m == NULL)
 		return (ENOMEM);
@@ -3003,6 +3816,7 @@ mwx_buf_fill(struct mwx_softc *sc, struct mwx_queue_data *md,
 	     BUS_DMA_READ | BUS_DMA_NOWAIT);
 	if (rv != 0) {
 		printf("%s: could not load data, %d\n", DEVNAME(sc), rv);
+		bus_dmamap_unload(sc->sc_dmat, md->md_map);
 		m_freem(m);
 		return (rv);
 	}
@@ -3031,7 +3845,7 @@ int
 mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 {
 	u_int idx, last;
-	int rv;
+	int rv = 0;
 
 	last = (q->mq_count + q->mq_cons - 1) % q->mq_count;
 	idx = q->mq_prod;
@@ -3042,20 +3856,49 @@ mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 	while (idx != last) {
 		rv = mwx_buf_fill(sc, &q->mq_data[idx], &q->mq_desc[idx]);
 		if (rv != 0) {
-			printf("%s: could not fill data, slot %d err %d\n",
-			    DEVNAME(sc), idx, rv);
-			return rv;
+			sc->sc_rx_refill_fail++;
+			if (!q->mq_refill_pending)
+				MWX_DEV_LOG(sc, "rx refill deferred reg=0x%x slot=%u rv=%d\n",
+				    q->mq_regbase, idx, rv);
+			q->mq_refill_pending = true;
+			break;
 		}
 		idx = (idx + 1) % q->mq_count;
 	}
 
+	/* Publish every successfully filled slot, including a partial batch.
+	 * A retry starts at the first missing slot, never at an owned mbuf. */
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	    BUS_DMASYNC_POSTWRITE);
+	if (idx != q->mq_prod) {
+		q->mq_prod = idx;
+		mwx_write(sc, q->mq_regbase + MT_DMA_CPU_IDX, q->mq_prod);
+	}
+	if (rv == 0) {
+		if (q->mq_refill_pending)
+			sc->sc_rx_refill_recover++;
+		q->mq_refill_pending = false;
+	}
+	return rv;
+}
 
-	q->mq_prod = idx;
-	mwx_write(sc, q->mq_regbase + MT_DMA_CPU_IDX, q->mq_prod);
-
-	return 0;
+/* The watchdog invokes debugPoll under the driver gate. One bounded fill
+ * attempt per RX ring per poll also recovers a ring with no new interrupts. */
+static void
+mwx_rx_refill_retry(struct mwx_softc *sc)
+{
+	if (!sc->sc_fw_loaded || sc->sc_detaching || sc->sc_resetting ||
+	    sc->sc_suspended || !(sc->sc_ic.ic_if.if_flags & IFF_RUNNING))
+		return;
+	struct mwx_queue *queues[] = {
+		&sc->sc_rxq, &sc->sc_rxmcuq, &sc->sc_rxfwdlq
+	};
+	for (u_int i = 0; i < nitems(queues); i++) {
+		struct mwx_queue *q = queues[i];
+		if (q->mq_refill_pending && q->mq_count > 1 &&
+		    q->mq_data != NULL && q->mq_desc != NULL && q->mq_map != NULL)
+			mwx_queue_fill(sc, q);
+	}
 }
 
 int
@@ -3064,8 +3907,21 @@ mwx_dma_alloc(struct mwx_softc *sc)
 	int rv;
 
 	MWX_DEV_LOG(sc, "dma alloc start\n");
+	{
+		int on = 0;
+		sc->sc_rx_pool_disabled =
+		    PE_parse_boot_argn("-mtknopool", &on, sizeof(on));
+	}
+	if (!sc->sc_rx_pool_disabled) {
+		rv = mwx_rx_pool_alloc(sc);
+		if (rv != 0)
+			MWX_DEV_LOG(sc, "rx pool alloc failed rv=%d, using bounce\n", rv);
+		else
+			MWX_DEV_LOG(sc, "rx pool ready pages=%u mask=4G\n",
+			    sc->sc_rx_pool_total);
+	}
 	/* TX queues */
-	if ((rv = mwx_queue_alloc(sc, &sc->sc_txq, 256,
+	if ((rv = mwx_queue_alloc(sc, &sc->sc_txq, 2048,
 	    MT_TX_DATA_RING_BASE)) != 0)
 		return rv;
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_txmcuq, 256,
@@ -3076,7 +3932,7 @@ mwx_dma_alloc(struct mwx_softc *sc)
 		return rv;
 
 	/* RX queues */
-	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxq, 256,
+	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxq, 1536,
 	    MT_RX_DATA_RING_BASE)) != 0 ||
 	    (rv = mwx_queue_fill(sc, &sc->sc_rxq)) != 0)
 		return rv;
@@ -3136,6 +3992,8 @@ mwx_dma_reset(struct mwx_softc *sc, int fullreset)
 void
 mwx_dma_free(struct mwx_softc *sc)
 {
+	mwx_rx_amsdu_purge(sc);
+	mwx_rx_pool_free(sc);
 	/* TX queues */
 	mwx_queue_free(sc, &sc->sc_txq);
 	mwx_queue_free(sc, &sc->sc_txmcuq);
@@ -3362,9 +4220,9 @@ mwx_dma_tx_done(struct mwx_softc *sc)
 
 /* XXX wrong place */
 void
-mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
+mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml,
+    struct mbuf_list *mlout, uint8_t rxqueue)
 {
-	struct mbuf_list mlout = MBUF_LIST_INITIALIZER();
 	struct mbuf *m;
 	uint32_t *data, rxd, type, flag;
 	uint32_t event_count = 0, notify_count = 0, normal_mcu_count = 0;
@@ -3399,11 +4257,11 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 			break;
 		case PKT_TYPE_NORMAL_MCU:
 			normal_mcu_count++;
-			mwx_rx(sc, m, &mlout);
+			mwx_rx(sc, m, mlout, rxqueue);
 			break;
 		case PKT_TYPE_NORMAL:
 			normal_count++;
-			mwx_rx(sc, m, &mlout);
+			mwx_rx(sc, m, mlout, rxqueue);
 			break;
 		default:
 			if (unknown_count == 0) {
@@ -3441,80 +4299,132 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 		}
 		sc->sc_rx_process_events++;
 	}
-
-	if_input(&sc->sc_ic.ic_if, &mlout);
 }
 
-void
+bool
 mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
     struct mbuf_list *ml)
 {
+	static const u_int quota = 64;
 	struct mwx_queue_data *md;
 	struct mwx_desc *desc;
-	struct mbuf *m, *m0 = NULL, *mtail = NULL;
+	struct mbuf *m;
 	int idx, last;
+	u_int consumed = 0;
 
+	sc->sc_rx_dma_batches++;
 	idx = q->mq_cons;
 	last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
-
-	if (idx == last)
-		return;
-	/* card gone or not reinitialized (all-ones read, e.g. after wake) */
-	if (last < 0 || last >= q->mq_count)
-		return;
+	if (idx == last || last < 0 || last >= q->mq_count)
+		return false;
+	if (q->mq_rx_head != NULL)
+		sc->sc_rx_dma_chain_resumed++;
 
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
-	     BUS_DMASYNC_PREREAD);
+	    BUS_DMASYNC_PREREAD);
 
 	while (idx != last) {
-		uint32_t ctrl;
-
+		if (consumed >= quota)
+			break;
 		md = &q->mq_data[idx];
 		desc = &q->mq_desc[idx];
-
-		bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
-		    md->md_map->dm_mapsize, BUS_DMASYNC_POSTREAD);
-		bus_dmamap_unload(sc->sc_dmat, md->md_map);
-
-		/* dequeue mbuf */
 		m = md->md_mbuf;
 		if (m == NULL) {
-			/* ring out of sync with the hardware: let a reset fix it */
 			static uint32_t rx_empty_log;
 			if (rx_empty_log++ < 8)
 				MWX_DEV_LOG(sc, "rx slot %d without buffer (dma idx %d)\n",
 				    idx, last);
+			if (q->mq_rx_head != NULL)
+				sc->sc_rx_dma_chain_dropped++;
+			m_freem(q->mq_rx_head);
+			q->mq_rx_head = q->mq_rx_tail = NULL;
+			q->mq_rx_bytes = q->mq_rx_segments = 0;
+			q->mq_rx_discard = true;
 			mwx_reset(sc);
 			break;
 		}
+
+		/* Validate descriptor lengths and aggregate bounds before copying
+		 * payload from a bounce buffer or changing an mbuf's bounds. */
+		const uint32_t ctrl = le32toh(desc->ctrl);
+		const size_t len = MT_DNA_CTL_SD_GET_LEN0(ctrl);
+		const bool last_segment = (ctrl & MT_DMA_CTL_LAST_SEC0) != 0;
+		bool valid = len != 0 && len <= md->md_map->dm_mapsize &&
+		    len <= mbuf_len(m) &&
+		    (q->mq_rx_head != NULL || q->mq_rx_discard ||
+		    len >= sizeof(uint32_t));
+		if (valid && !q->mq_rx_discard &&
+		    (q->mq_rx_segments >= MWX_RX_CHAIN_MAX_SEGS ||
+		    len > MWX_RX_CHAIN_MAX_BYTES - q->mq_rx_bytes))
+			valid = false;
+		if (!valid) {
+			sc->sc_rx_dma_bad_len++;
+			if (!q->mq_rx_discard)
+				sc->sc_rx_dma_chain_dropped++;
+			q->mq_rx_discard = true;
+		}
+		if (valid)
+			sc->sc_rx_dma_bytes += len;
+		if (!q->mq_rx_discard) {
+			if (md->md_map->dm_bounce) {
+				sc->sc_rx_dma_copy_bytes += len;
+				sc->sc_rx_dma_copy_saved += md->md_map->dm_mapsize - len;
+			}
+			bus_dmamap_sync(sc->sc_dmat, md->md_map, 0, len,
+			    BUS_DMASYNC_POSTREAD);
+			/* The normal decoder reads its base RXD directly from the
+			 * first mbuf. Other packet types only need their first word
+			 * here and perform their own pullup before deeper parsing. */
+			if (q->mq_rx_head == NULL) {
+				const uint32_t rxd0 = le32toh(*mtod(m, uint32_t *));
+				const uint32_t type = MT_RXD0_PKT_TYPE_GET(rxd0);
+				if ((type == PKT_TYPE_NORMAL ||
+				    type == PKT_TYPE_NORMAL_MCU) &&
+				    len < 6U * sizeof(uint32_t)) {
+					sc->sc_rx_dma_bad_len++;
+					sc->sc_rx_dma_chain_dropped++;
+					q->mq_rx_discard = true;
+				}
+			}
+		}
+		bus_dmamap_unload(sc->sc_dmat, md->md_map);
 		md->md_mbuf = NULL;
 
-		/* only buf0 is used on RX rings */
-		ctrl = le32toh(desc->ctrl);
-		mbuf_setlen(m, MT_DNA_CTL_SD_GET_LEN0(ctrl));
-
-		if (m0 == NULL) {
-			m0 = mtail = m;
-			mbuf_pkthdr_setlen(m0, mbuf_len(m));
+		/* Continuations must not carry an independent packet header. */
+		if (!q->mq_rx_discard && q->mq_rx_head != NULL &&
+		    mbuf_setflags_mask(m, 0, MBUF_PKTHDR) != 0) {
+			sc->sc_rx_dma_chain_dropped++;
+			q->mq_rx_discard = true;
+		}
+		if (q->mq_rx_discard) {
+			m_freem(m);
+			m_freem(q->mq_rx_head);
+			q->mq_rx_head = q->mq_rx_tail = NULL;
+			q->mq_rx_bytes = q->mq_rx_segments = 0;
+			if (last_segment)
+				q->mq_rx_discard = false;
 		} else {
-			mbuf_setnext(mtail, m);
-			mtail = m;
-			mbuf_pkthdr_setlen(m0, mbuf_pkthdr_len(m0) + mbuf_len(m));
+			mbuf_setlen(m, len);
+			if (q->mq_rx_head == NULL)
+				q->mq_rx_head = m;
+			else
+				mbuf_setnext(q->mq_rx_tail, m);
+			q->mq_rx_tail = m;
+			q->mq_rx_bytes += len;
+			q->mq_rx_segments++;
+			mbuf_pkthdr_setlen(q->mq_rx_head, q->mq_rx_bytes);
+			if (last_segment) {
+				if (q->mq_rx_segments > 1)
+					sc->sc_rx_dma_chain_completed++;
+				struct mbuf *complete = q->mq_rx_head;
+				q->mq_rx_head = q->mq_rx_tail = NULL;
+				q->mq_rx_bytes = q->mq_rx_segments = 0;
+				ml_enqueue(ml, complete);
+			}
 		}
 
-		/* TODO handle desc->info */
-
-		/* check if this was the last mbuf of the chain */
-		if (ctrl & MT_DMA_CTL_LAST_SEC0) {
-			ml_enqueue(ml, m0);
-			m0 = NULL;
-			mtail = NULL;
-		}
-
+		consumed++;
 		idx = (idx + 1) % q->mq_count;
-
-		/* check if more data made it in */
-		/* XXX should we actually do that? */
 		if (idx == last) {
 			last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
 			if (last < 0 || last >= q->mq_count)
@@ -3522,33 +4432,34 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 		}
 	}
 
-	/* a chain cut short by the out-of-sync check above */
-	if (m0 != NULL) {
-		m_freem(m0);
-		m0 = NULL;
-	}
-	/* XXX make sure we don't have half processed data */
-	KASSERT(m0 == NULL);
-
+	/* Keep a bounded, detached prefix until the next batch supplies LAST.
+	 * Reset/free release it; malformed chains stay in discard mode through
+	 * LAST so their continuation cannot be mistaken for a new RXD. */
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	    BUS_DMASYNC_POSTREAD);
-
 	q->mq_cons = idx;
+	sc->sc_rx_dma_desc += consumed;
+	if (consumed > sc->sc_rx_dma_max_batch)
+		sc->sc_rx_dma_max_batch = consumed;
+	return idx != last;
 }
 
-void
-mwx_dma_rx_done(struct mwx_softc *sc, struct mwx_queue *q)
+bool
+mwx_dma_rx_done(struct mwx_softc *sc, struct mwx_queue *q,
+    struct mbuf_list *mlout)
 {
 	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+	const u_int old_cons = q->mq_cons;
+	bool more;
 
-	mwx_dma_rx_dequeue(sc, q, &ml);
-
-	if (ml_empty(&ml))
-		return;
-
-	mwx_queue_fill(sc, q);	/* TODO what if it fails, run timer? */
-
-	mwx_dma_rx_process(sc, &ml);
+	more = mwx_dma_rx_dequeue(sc, q, &ml);
+	/* Invalid or incomplete frames still consume DMA slots. */
+	if (q->mq_cons != old_cons || q->mq_refill_pending)
+		mwx_queue_fill(sc, q);
+	if (!ml_empty(&ml))
+		mwx_dma_rx_process(sc, &ml, mlout,
+		    q == &sc->sc_rxq ? 0 : q == &sc->sc_rxmcuq ? 1 : 2);
+	return more;
 }
 
 struct mbuf *
@@ -3755,6 +4666,23 @@ mwx_mcu_send_mbuf_wait(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m)
 	return mwx_mcu_wait_resp_int(sc, cmd, seq, NULL);
 }
 
+/* Inspect fire-and-forget STA/WTBL results without blocking the RX work loop.
+ * This is diagnostic only: enqueue success still is not firmware success. */
+static void
+mwx_mcu_trace_sta_status(struct mwx_softc *sc, uint8_t eid, uint8_t seq,
+    struct mbuf *m)
+{
+	if (eid != MCU_UNI_EVENT_RESULT ||
+	    mbuf_len(m) < sizeof(struct mt7921_mcu_uni_event))
+		return;
+	const struct mt7921_mcu_uni_event *event =
+	    mtod(m, struct mt7921_mcu_uni_event *);
+	if (event->cid != (MCU_UNI_CMD_STA_REC_UPDATE & MCU_CMD_FIELD_ID_MASK))
+		return;
+	MWX_DEV_LOG(sc, "STA_REC firmware result seq=%u status=%u\n",
+	    seq, le32toh(event->status));
+}
+
 void
 mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 {
@@ -3787,6 +4715,7 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	rxd_ext_eid = rxd->ext_eid;
 	rxd_seq = rxd->seq;
 	m_adj(m, sizeof(*rxd));
+	mwx_mcu_trace_sta_status(sc, rxd_eid, rxd_seq, m);
 
 	switch (rxd_eid) {
 	case MCU_EVENT_SCHED_SCAN_DONE:
@@ -5291,6 +6220,11 @@ mwx_node_chan_width(struct ieee80211_node *ni, uint8_t *bw, uint8_t *center)
 	if (ni->ni_chan->ic_center_freq1 == 0)
 		return;
 	if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
+	    ni->ni_chw == IEEE80211_CHAN_WIDTH_160) {
+		*bw = CMD_CBW_160MHZ;
+		*center = ieee80211_mhz2ieee(ni->ni_chan->ic_center_freq1,
+		    ni->ni_chan->ic_flags);
+	} else if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
 	    ni->ni_chw == IEEE80211_CHAN_WIDTH_80) {
 		*bw = CMD_CBW_80MHZ;
 		*center = ieee80211_mhz2ieee(ni->ni_chan->ic_center_freq1,
@@ -5772,10 +6706,37 @@ mt7921_mcu_set_bss_pm(struct mwx_softc *sc, int enable)
 	return rv;
 }
 
+/* Association-response parsing runs before NODE_QOS is set; RUN applies
+ * the first parameter set explicitly. Later beacon updates can submit here. */
+void
+mwx_updateedca(struct ieee80211com *ic)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+
+	if (sc == NULL || sc->sc_suspended ||
+	    !(ic->ic_if.if_flags & IFF_RUNNING) ||
+	    ic->ic_state != IEEE80211_S_RUN || !sc->sc_sta_added)
+		return;
+
+	int rv = mt7921_mcu_set_tx(sc, &sc->sc_vif);
+	if (rv) {
+		/* Retry even if the next beacon has the same update count. */
+		ic->ic_edca_updtcount = (u_int)-1;
+		MWX_DEV_LOG(sc, "EDCA update failed rv=%d; retry next beacon\n", rv);
+	}
+}
+
 #define IEEE80211_NUM_ACS	4
 int
 mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
+	const int qos = (ic->ic_flags & IEEE80211_F_QOS) &&
+	    sc->sc_sta_added && ic->ic_bss != NULL &&
+	    IEEE80211_AID(ic->ic_bss->ni_associd) != 0 &&
+	    (ic->ic_bss->ni_flags & IEEE80211_NODE_QOS) &&
+	    (ic->ic_state == IEEE80211_S_ASSOC ||
+	    ic->ic_state == IEEE80211_S_RUN);
 	struct edca {
 		uint16_t	cw_min;
 		uint16_t	cw_max;
@@ -5792,7 +6753,7 @@ mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 		uint8_t		pad;
 	} __packed req = {
 		.bss_idx = mvif->idx,
-		.qos = /* vif->bss_conf.qos */ 0,
+		.qos = !!qos,
 		.wmm_idx = mvif->wmm_idx,
 	};
 #ifdef NOTYET
@@ -5820,29 +6781,36 @@ mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 		.wmm_idx = mvif->mt76.wmm_idx,
 	};
 #endif
-	static const int to_aci[] = { 1, 0, 2, 3 };
+	/* net80211 BE/BK/VI/VO -> firmware BE/BK/VI/VO slots.
+	 * Linux's {1,0,2,3} map starts from its different VO/VI/BE/BK order. */
+	static const int to_aci[EDCA_NUM_AC] = { 2, 3, 0, 1 };
 	int ac, rv;
 
-	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
-		//struct ieee80211_tx_queue_params *q = &mvif->queue_params[ac];
+	for (ac = 0; ac < EDCA_NUM_AC; ac++) {
+		const struct ieee80211_edca_ac_params *q = &ic->ic_edca_ac[ac];
 		struct edca *e = &req.edca[to_aci[ac]];
 
-		e->aifs = htole16(/* q->aifs */ 2);
-		e->txop = htole16(/* q->txop */ 0);
+		/* Keep the existing non-QoS initialization defaults. */
+		e->aifs = htole16(2);
+		e->cw_min = htole16(5);
+		e->cw_max = htole16(10);
+		if (!qos)
+			continue;
+		if (q->ac_aifsn == 0 || q->ac_aifsn > 15 ||
+		    q->ac_ecwmin > 15 || q->ac_ecwmax > 15 ||
+		    q->ac_ecwmin > q->ac_ecwmax)
+			return EINVAL;
 
-#ifdef NOTYET
-		if (q->cw_min)
-			e->cw_min = htole16(q->cw_min);
-		else
-#endif
-			e->cw_min = htole16(5);
-
-#ifdef NOTYET
-		if ( q->cw_max)
-			e->cw_max = htole16(q->cw_max);
-		else
-#endif
-			e->cw_max = htole16(10);
+		e->aifs = htole16(q->ac_aifsn);
+		e->txop = htole16(q->ac_txoplimit); /* 32 us units */
+		/* SET_EDCA_PARMS takes actual CW values, not ECW exponents. */
+		e->cw_min = htole16((1U << q->ac_ecwmin) - 1);
+		e->cw_max = htole16((1U << q->ac_ecwmax) - 1);
+		e->acm = q->ac_acm & 1;
+		MWX_DEV_LOG(sc, "EDCA ac=%d slot=%d qos=1 aifs=%u cw=%u/%u txop=%u acm=%u\n",
+		    ac, to_aci[ac], q->ac_aifsn,
+		    (1U << q->ac_ecwmin) - 1, (1U << q->ac_ecwmax) - 1,
+		    q->ac_txoplimit, e->acm);
 	}
 
 	rv = mwx_mcu_send_msg(sc, MCU_CE_CMD_SET_EDCA_PARMS, &req,
@@ -5887,6 +6855,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	uint16_t hdr_gap /*, seq_ctrl = 0, fc = 0 */;
 	uint8_t chfnum, remove_pad /*, qos_ctl = 0, amsdu_info */;
 	int idx, unicast, num_rxd = 6;
+	uint32_t ampdu_timestamp = 0;
 	int i;
 //	bool insert_ccmp_hdr = false;
 
@@ -5905,6 +6874,25 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	rxd2 = le32toh(rxd[2]);
 	rxd3 = le32toh(rxd[3]);
 	rxd4 = le32toh(rxd[4]);
+
+	/* Validate the entire optional descriptor before reading RXV words. The
+	 * later length check is too late for GROUP_3/GROUP_5's direct loads. */
+	{
+		size_t words = 6;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_4)
+			words += 4;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_1)
+			words += 4;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_2)
+			words += 2;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_3) {
+			words += 2;
+			if (rxd1 & MT_RXD1_NORMAL_GROUP_5)
+				words += 18;
+		}
+		if (mbuf_len(m) < words * sizeof(uint32_t))
+			return -1;
+	}
 
 	if (rxd1 & MT_RXD1_NORMAL_BAND_IDX) {
 		MWX_RX_DROP_LOG(sc, "band-idx", -1, rxd0, rxd1, rxd2,
@@ -6014,6 +7002,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		rxd += 4;
 	}
 	if (rxd1 & MT_RXD1_NORMAL_GROUP_2) {
+		ampdu_timestamp = le32toh(rxd[0]);
 		num_rxd += 2;
 		rxd += 2;
 	}
@@ -6284,6 +7273,19 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	status->qos_ctl = qos_ctl;
 #endif
 	rxi->rxi_chan = chfnum;
+
+	/* Observe only unicast data MPDUs; do not count management/control traffic
+	 * or hardware A-MSDU subframes as independent aggregate members. */
+	{
+		struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+		if (unicast && (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+		    IEEE80211_FC0_TYPE_DATA &&
+		    !(wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_NODATA))
+			mtkRxAmpduObserve(sc->sc_rx_ampdu_stats,
+			    (rxd1 & MT_RXD1_NORMAL_GROUP_2) != 0, ampdu_timestamp,
+			    (rxd2 & MT_RXD2_NORMAL_NON_AMPDU) != 0,
+			    (rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT) != 0);
+	}
 
 	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
 		/*
@@ -6701,10 +7703,8 @@ mt7921_get_phy_mode_v2(struct mwx_softc *sc, struct ieee80211_node *ni)
 		mode |= PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP;
 		if (ieee80211_node_supports_ht(ni))
 			mode |= PHY_TYPE_BIT_HT;
-#ifdef NOTYET
-		if (ieee80211_node_supports_he(ni))
+		if ((ni->ni_flags & IEEE80211_NODE_HE) && sc->sc_he_enabled)
 			mode |= PHY_TYPE_BIT_HE;
-#endif
 	} else if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) /* || CHAN_6GHZ */) {
 		mode |= PHY_TYPE_BIT_OFDM;
 		if (ieee80211_node_supports_ht(ni))
@@ -6712,6 +7712,8 @@ mt7921_get_phy_mode_v2(struct mwx_softc *sc, struct ieee80211_node *ni)
 		/* only once VHT is actually negotiated (not just supported) */
 		if (ni->ni_flags & IEEE80211_NODE_VHT)
 			mode |= PHY_TYPE_BIT_VHT;
+		if ((ni->ni_flags & IEEE80211_NODE_HE) && sc->sc_he_enabled)
+			mode |= PHY_TYPE_BIT_HE;
 #ifdef NOTYET
 		if (ieee80211_node_supports_he(ni))
 			mode |= PHY_TYPE_BIT_HE;
@@ -6944,6 +7946,8 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 			HT_MCS_MASK_NUM);
 #endif
 
+	if ((ni->ni_flags & IEEE80211_NODE_HE) && sc->sc_he_enabled)
+		mwx_add_sta_he_tlvs(m, tlvnum, ni);
 	state = (struct sta_rec_state *)mwx_append_tlv(m, tlvnum,
 	    STA_REC_STATE, sizeof(*state));
 	state->state = /* XXX sta_state */ 0;
@@ -7015,16 +8019,39 @@ int
 mt7921_mcu_wtbl_ht_tlv(struct mbuf *m, uint16_t *tlvnum,
     struct mwx_softc *sc, struct ieee80211_node *ni)
 {
+	struct wtbl_ht *ht = NULL;
 	struct wtbl_smps *smps;
+	int len = 0;
 
-	/* XXX lots missing here */
+	/* Connac2 hardware needs these in addition to the STA_REC capabilities. */
+	if (ni->ni_flags & IEEE80211_NODE_HT) {
+		ht = (struct wtbl_ht *)mwx_append_tlv(m, tlvnum,
+		    WTBL_HT, sizeof(*ht));
+		ht->ht = 1;
+		ht->ldpc = !!(ni->ni_htcaps & IEEE80211_HTCAP_LDPC);
+		ht->af = ni->ni_ampdu_param & 0x3;
+		ht->mm = (ni->ni_ampdu_param >> 2) & 0x7;
+		len += sizeof(*ht);
+	}
+	if (ni->ni_flags & IEEE80211_NODE_VHT) {
+		struct wtbl_vht *vht = (struct wtbl_vht *)mwx_append_tlv(m,
+		    tlvnum, WTBL_VHT, sizeof(*vht));
+		vht->vht = 1;
+		vht->ldpc = !!(ni->ni_vhtcaps & IEEE80211_VHTCAP_RXLDPC);
+		uint8_t af = (ni->ni_vhtcaps &
+		    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK) >>
+		    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT;
+		if (ht && af > ht->af)
+			ht->af = af;
+		len += sizeof(*vht);
+	}
 
 	smps = (struct wtbl_smps *)mwx_append_tlv(m, tlvnum, WTBL_SMPS,
 	    sizeof(*smps));
 	/* spatial multiplexing power save mode, off for now */
 	//smps->smps = (sta->deflink.smps_mode == IEEE80211_SMPS_DYNAMIC);
 
-	return sizeof(*smps);
+	return len + sizeof(*smps);
 }
 
 int
@@ -7277,6 +8304,24 @@ MtkMwx::attach(IOPCIDevice *device)
 		releaseAll();
 		return false;
 	}
+	if (com->sc_rx_amsdu_lock == NULL)
+		com->sc_rx_amsdu_lock = IOLockAlloc();
+	if (com->sc_rx_amsdu_lock == NULL) {
+		releaseAll();
+		return false;
+	}
+	if (com->sc_rx_pool_lock == NULL)
+		com->sc_rx_pool_lock = IOSimpleLockAlloc();
+	if (com->sc_rx_pool_lock == NULL) {
+		releaseAll();
+		return false;
+	}
+	SLIST_INIT(&com->sc_rx_pool_free);
+	com->sc_rx_amsdu_gate = getMainCommandGate();
+	if (com->sc_rx_amsdu_gate == NULL) {
+		releaseAll();
+		return false;
+	}
 	MWX_LOG("HAL attach allocated com=%p pci=%p\n",
 	    (void *)com, (void *)pci);
 
@@ -7313,17 +8358,26 @@ MtkMwx::detach(IOPCIDevice *device)
     }
     struct ifnet *ifp = &com->sc_ic.ic_if;
     com->sc_detaching = true;
+    mwx_rx_amsdu_begin_teardown(com);
     timeout_del(&com->sc_reset_to);
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
-    if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
+    if (ifp->if_flags & IFF_RUNNING) mwx_stop_internal(ifp, true);
     timeout_free(&com->sc_reset_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {
         pci_intr_disestablish(pci->pa_pc, com->sc_ih);
         com->sc_ih = NULL;
     }
+    if (com->sc_rx_amsdu_lock) {
+        IOLockLock(com->sc_rx_amsdu_lock);
+        com->sc_rx_amsdu_irq_quiesced = true;
+        IOLockUnlock(com->sc_rx_amsdu_lock);
+    }
+    mwx_rx_amsdu_purge(com);
+    if (com->sc_net_attached && com->sc_newstate != NULL)
+        com->sc_newstate(&com->sc_ic, IEEE80211_S_INIT, -1);
     if (com->sc_memh) {
         mwx_write(com, MT_WFDMA0_HOST_INT_ENA, 0);
         mwx_dma_disable(com, 1);
@@ -7497,6 +8551,22 @@ MtkMwx::getRxRateMcs()
 }
 
 void
+MtkMwx::accountOutputStart(uint32_t reason)
+{
+	if (com == NULL)
+		return;
+	com->sc_output_start_cnt++;
+	switch (reason) {
+	case 1: com->sc_output_noqueue_cnt++; break;
+	case 2: com->sc_output_active_cnt++; break;
+	case 3: com->sc_output_capacity_cnt++; break;
+	case 4: com->sc_output_dequeue_fail_cnt++; break;
+	case 5: com->sc_output_post_active_cnt++; break;
+	default: com->sc_output_kick_fail_cnt++; break;
+	}
+}
+
+void
 MtkMwx::clearScanningFlags()
 {
 	if (com)
@@ -7514,6 +8584,17 @@ MtkMwx::releaseAll()
 {
 	MWX_LOG("HAL releaseAll com=%p pci=%p\n", (void *)com, (void *)pci);
 	if (com) {
+		mwx_rx_amsdu_purge(com);
+		mwx_rx_pool_free(com);
+		if (com->sc_rx_pool_lock) {
+			IOSimpleLockFree(com->sc_rx_pool_lock);
+			com->sc_rx_pool_lock = NULL;
+		}
+		if (com->sc_rx_amsdu_lock) {
+			IOLockFree(com->sc_rx_amsdu_lock);
+			com->sc_rx_amsdu_lock = NULL;
+		}
+		com->sc_rx_amsdu_gate = NULL;
 		mwx_free_mem(com);
 		com = NULL;
 	}
@@ -7542,6 +8623,75 @@ static int mwx_send_assoc_status(struct mwx_softc *sc, uint32_t cmd, void *data,
     rv = mwx_mcu_wait_resp_int(sc, cmd, seq, &status);
     MWX_DEV_LOG(sc, "assoc_status cmd=%x transport=%d firmware=%u\n", cmd, rv, status);
     return rv ? rv : (status ? EIO : 0);
+}
+
+static void
+mwx_add_sta_he_tlvs(struct mbuf *m, uint16_t *tlvnum,
+    struct ieee80211_node *ni)
+{
+	const struct ieee80211_he_cap_elem *elem = &ni->ni_he_cap_elem;
+	const struct ieee80211_he_mcs_nss_supp *mcs = &ni->ni_he_mcs_nss_supp;
+	struct sta_rec_he *he;
+	struct sta_rec_he_v2 *v2;
+	uint32_t cap = 0;
+
+	he = (struct sta_rec_he *)mwx_append_tlv(m, tlvnum,
+	    STA_REC_HE, sizeof(*he));
+	if (elem->mac_cap_info[0] & IEEE80211_HE_MAC_CAP0_HTC_HE)
+		cap |= STA_REC_HE_CAP_HTC;
+	if (elem->mac_cap_info[3] & IEEE80211_HE_MAC_CAP3_OMI_CONTROL)
+		cap |= STA_REC_HE_CAP_OM;
+	if (elem->mac_cap_info[4] & IEEE80211_HE_MAC_CAP4_AMDSU_IN_AMPDU)
+		cap |= STA_REC_HE_CAP_AMSDU_IN_AMPDU;
+	if (elem->phy_cap_info[0] &
+	    (IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_2G |
+		 IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_5G))
+		cap |= STA_REC_HE_CAP_BW20_RU242_SUPPORT;
+	if (elem->phy_cap_info[1] &
+	    IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD)
+		cap |= STA_REC_HE_CAP_LDPC;
+	if (elem->phy_cap_info[1] &
+	    IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US)
+		cap |= STA_REC_HE_CAP_SU_PPDU_1LTF_8US_GI;
+	if (elem->phy_cap_info[6] &
+	    IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE)
+		cap |= STA_REC_HE_CAP_PARTIAL_BW_EXT_RANGE;
+	if (elem->phy_cap_info[7] &
+	    IEEE80211_HE_PHY_CAP7_HE_SU_MU_PPDU_4XLTF_AND_08_US_GI)
+		cap |= STA_REC_HE_CAP_SU_MU_PPDU_4LTF_8US_GI;
+	if (elem->phy_cap_info[9] &
+	    IEEE80211_HE_PHY_CAP9_NON_TRIGGERED_CQI_FEEDBACK)
+		cap |= STA_REC_HE_CAP_TRIG_CQI_FK;
+	if (elem->phy_cap_info[9] &
+	    IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU)
+		cap |= STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242;
+	if (elem->phy_cap_info[9] &
+	    IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU)
+		cap |= STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242;
+	he->he_cap = htole32(cap);
+	he->t_frame_dur = (elem->mac_cap_info[1] &
+	    IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_MASK) >> 2;
+	he->max_ampdu_exp = (elem->mac_cap_info[3] &
+	    IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_MASK) >> 3;
+	he->bw_set = (elem->phy_cap_info[0] &
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_MASK) >> 1;
+	he->device_class = (elem->phy_cap_info[1] &
+	    IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A) ? 1 : 0;
+	he->punc_pream_rx = elem->phy_cap_info[1] &
+	    IEEE80211_HE_PHY_CAP1_PREAMBLE_PUNC_RX_MASK;
+	he->pkt_ext = 2;
+	he->max_nss_mcs[CMD_HE_MCS_BW80] = mcs->rx_mcs_80;
+	he->max_nss_mcs[CMD_HE_MCS_BW160] = mcs->rx_mcs_160;
+	he->max_nss_mcs[CMD_HE_MCS_BW8080] = mcs->rx_mcs_80p80;
+
+	v2 = (struct sta_rec_he_v2 *)mwx_append_tlv(m, tlvnum,
+	    STA_REC_HE_V2, sizeof(*v2));
+	memcpy(v2->he_mac_cap, elem->mac_cap_info, sizeof(v2->he_mac_cap));
+	memcpy(v2->he_phy_cap, elem->phy_cap_info, sizeof(v2->he_phy_cap));
+	v2->pkt_ext = 2;
+	v2->max_nss_mcs[CMD_HE_MCS_BW80] = mcs->rx_mcs_80;
+	v2->max_nss_mcs[CMD_HE_MCS_BW160] = mcs->rx_mcs_160;
+	v2->max_nss_mcs[CMD_HE_MCS_BW8080] = mcs->rx_mcs_80p80;
 }
 
 /* Publish the associated peer without resetting WTBL or key state. */
@@ -7585,25 +8735,40 @@ int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
     if (ni->ni_flags & IEEE80211_NODE_VHT) {
         struct sta_rec_vht_v1 *vht = (struct sta_rec_vht_v1 *)mwx_append_tlv(m,
             &tlvnum, STA_REC_VHT, sizeof(*vht));
-        /* peer capabilities without 160/80+80 (we only do 80 MHz) */
-        vht->vht_cap = htole32(ni->ni_vhtcaps &
-            ~IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_MASK);
+        /* net80211 already intersects peer and local VHT capabilities. */
+        vht->vht_cap = htole32(ni->ni_vhtcaps);
         vht->vht_rx_mcs_map = htole16(ni->ni_vht_mcsinfo.rx_mcs_map);
         vht->vht_tx_mcs_map = htole16(ni->ni_vht_mcsinfo.tx_mcs_map);
     }
+    if ((ni->ni_flags & IEEE80211_NODE_HE) && sc->sc_he_enabled)
+        mwx_add_sta_he_tlvs(m, &tlvnum, ni);
     struct sta_rec_state *state = (struct sta_rec_state *)mwx_append_tlv(m, &tlvnum, STA_REC_STATE, sizeof(*state));
     state->state = 2; /* MT76_STA_INFO_STATE_ASSOC: NONE=0, AUTH=1, ASSOC=2. */
     if (ni->ni_flags & IEEE80211_NODE_VHT) {
         /* bandwidth (0=20, 2=80) | (rx nss - 1) << 4 */
         uint8_t bw, center;
         mwx_node_chan_width(ni, &bw, &center);
-        state->vht_opmode = (bw == CMD_CBW_80MHZ ? 2 :
+        state->vht_opmode = (bw == CMD_CBW_160MHZ ? 3 :
+            bw == CMD_CBW_80MHZ ? 2 :
             bw == CMD_CBW_40MHZ ? 1 : 0) |
             ((sc->sc_capa.num_streams > 1 ? 1 : 0) << 4);
         MWX_DEV_LOG(sc, "assoc_peer VHT vhtcaps=0x%08x rxmcs=0x%04x txmcs=0x%04x chw=%d center=%u opmode=0x%02x\n",
             ni->ni_vhtcaps, ni->ni_vht_mcsinfo.rx_mcs_map,
             ni->ni_vht_mcsinfo.tx_mcs_map, ni->ni_chw, center,
             state->vht_opmode);
+    }
+    if (ni->ni_flags & IEEE80211_NODE_HT) {
+        /* Refresh after association, without resetting the installed keys. */
+        struct sta_rec_wtbl *wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(
+            m, &tlvnum, STA_REC_WTBL, sizeof(*wtbl));
+        uint16_t wnum = 0;
+        const uint16_t wcid = ((struct mwx_node *)ni)->wcid;
+        wtbl->wlan_idx_lo = wcid & 0xff;
+        wtbl->wlan_idx_hi = wcid >> 8;
+        wtbl->operation = WTBL_SET;
+        int wlen = mt7921_mcu_wtbl_ht_tlv(m, &wnum, sc, ni);
+        wtbl->tlv_num = htole16(wnum);
+        wtbl->len = htole16(sizeof(*wtbl) + wlen);
     }
     m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx, ((struct mwx_node *)ni)->wcid, tlvnum);
     if (!m) return ENOBUFS;
@@ -7620,6 +8785,43 @@ int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
  * Called from RX processing, so do not wait for the MCU response here.
  */
 static int
+mwx_mcu_wtbl_ba(struct mwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
+    uint16_t ssn, uint16_t winsize, int enable, int tx)
+{
+	struct mwx_node *mn = (struct mwx_node *)ni;
+	struct mbuf *m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	uint16_t tlvnum = 0, wnum = 0;
+	if (m == NULL)
+		return ENOBUFS;
+	struct sta_rec_wtbl *wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m,
+	    &tlvnum, STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = mn->wcid & 0xff;
+	wtbl->wlan_idx_hi = mn->wcid >> 8;
+	wtbl->operation = WTBL_SET;
+	struct wtbl_ba *ba = (struct wtbl_ba *)mwx_append_tlv(m, &wnum,
+	    WTBL_BA, sizeof(*ba));
+	ba->tid = tid;
+	ba->ba_type = tx ? MT_BA_TYPE_ORIGINATOR : MT_BA_TYPE_RECIPIENT;
+	ba->ba_winsize = enable ? htole16(winsize) : 0;
+	if (tx) {
+		ba->sn = enable ? htole16(ssn) : 0;
+		ba->ba_en = !!enable;
+	} else {
+		memcpy(ba->peer_addr, ni->ni_macaddr, IEEE80211_ADDR_LEN);
+		ba->rst_ba_tid = tid;
+		ba->rst_ba_sel = RST_BA_MAC_TID_MATCH;
+		ba->rst_ba_sb = 1;
+	}
+	wtbl->tlv_num = htole16(wnum);
+	wtbl->len = htole16(sizeof(*wtbl) + sizeof(*ba));
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	return mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, NULL);
+}
+
+static int
 mwx_mcu_sta_ba(struct mwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
     uint16_t ssn, uint16_t winsize, int enable, int tx, int amsdu)
 {
@@ -7628,6 +8830,18 @@ mwx_mcu_sta_ba(struct mwx_softc *sc, struct ieee80211_node *ni, uint8_t tid,
 	struct mbuf *m;
 	uint16_t tlvnum = 0;
 
+	if (ni == NULL || tid >= 8 || (enable &&
+	    (winsize == 0 || winsize > IEEE80211_BA_MAX_WINSZ)))
+		return EINVAL;
+	/* Program the hardware table before updating firmware session state.
+	 * Do not wait here: RX processing shares the MCU completion work loop. */
+	if (sc->sc_wtbl_ba) {
+		int rv = mwx_mcu_wtbl_ba(sc, ni, tid, ssn, winsize, enable, tx);
+		MWX_DEV_LOG(sc, "%s WTBL BA tid=%u enable=%d win=%u queued=%d\n",
+		    tx ? "tx" : "rx", tid, enable, winsize, rv);
+		if (rv)
+			return rv;
+	}
 	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
 	if (m == NULL)
 		return ENOBUFS;
@@ -7654,9 +8868,16 @@ mwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
 	int rv;
 
-	rv = mwx_mcu_sta_ba(sc, ni, tid, ba->ba_winstart, ba->ba_winsize, 1, 0, 0);
-	MWX_DEV_LOG(sc, "rx BA start tid=%u ssn=%u win=%u rv=%d\n", tid,
-	    ba->ba_winstart, ba->ba_winsize, rv);
+	mwx_rx_amsdu_purge(sc, tid);
+	const bool crypto_supported = !(ic->ic_flags & (IEEE80211_F_RSNON | IEEE80211_F_WEPON)) ||
+	    ni->ni_pairwise_key.k_cipher == IEEE80211_CIPHER_CCMP;
+	const bool amsdu = sc->sc_rx_amsdu_enabled && crypto_supported &&
+	    (ba->ba_params & IEEE80211_ADDBA_AMSDU);
+	if (!amsdu)
+		ba->ba_params &= ~IEEE80211_ADDBA_AMSDU;
+	rv = mwx_mcu_sta_ba(sc, ni, tid, ba->ba_winstart, ba->ba_winsize, 1, 0, amsdu);
+	MWX_DEV_LOG(sc, "rx BA start tid=%u ssn=%u win=%u amsdu=%d rv=%d\n", tid,
+	    ba->ba_winstart, ba->ba_winsize, amsdu, rv);
 	return rv;
 }
 
@@ -7667,6 +8888,7 @@ mwx_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	int rv;
 
+	mwx_rx_amsdu_purge(sc, tid);
 	rv = mwx_mcu_sta_ba(sc, ni, tid, 0, 0, 0, 0, 0);
 	MWX_DEV_LOG(sc, "rx BA stop tid=%u rv=%d\n", tid, rv);
 }
@@ -7703,6 +8925,45 @@ mwx_ampdu_tx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	rv = mwx_mcu_sta_ba(sc, ni, tid, 0, 0, 0, 1, 0);
 	MWX_DEV_LOG(sc, "tx BA stop tid=%u rv=%d\n", tid, rv);
+}
+
+static int
+mwx_send_bss_he_info(struct mwx_softc *sc, struct ieee80211_node *ni)
+{
+	struct mwx_vif *mvif = &sc->sc_vif;
+	struct {
+		struct {
+			uint8_t bss_idx;
+			uint8_t pad[3];
+		} __packed hdr;
+		struct bss_info_uni_he he;
+		struct bss_info_uni_bss_color color;
+	} __packed req = {};
+	int rv;
+
+	req.hdr.bss_idx = mvif->idx;
+	req.he.tag = htole16(UNI_BSS_INFO_HE_BASIC);
+	req.he.len = htole16(sizeof(req.he));
+	req.he.he_pe_duration = 4;
+	req.he.he_rts_thres = htole16(1023);
+	req.he.max_nss_mcs[CMD_HE_MCS_BW80] =
+	    sc->sc_ic.ic_he_mcs_nss_supp.tx_mcs_80;
+	req.he.max_nss_mcs[CMD_HE_MCS_BW160] =
+	    sc->sc_ic.ic_he_mcs_nss_supp.tx_mcs_160;
+	req.he.max_nss_mcs[CMD_HE_MCS_BW8080] =
+	    sc->sc_ic.ic_he_mcs_nss_supp.tx_mcs_80p80;
+	req.color.tag = htole16(UNI_BSS_INFO_BSS_COLOR);
+	req.color.len = htole16(sizeof(req.color));
+	req.color.enable = 0;
+	req.color.bss_color = 0;
+	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
+	    &req, sizeof(req));
+	MWX_DEV_LOG(sc,
+	    "BSS HE enable=%d pe=%u rts=%u mcs80=0x%04x mcs160=0x%04x rv=%d\n",
+	    1, req.he.he_pe_duration, le16toh(req.he.he_rts_thres),
+	    le16toh(req.he.max_nss_mcs[CMD_HE_MCS_BW80]),
+	    le16toh(req.he.max_nss_mcs[CMD_HE_MCS_BW160]), rv);
+	return rv;
 }
 
 int
@@ -7759,6 +9020,8 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 		    (1U << 4) /* AN */;
 	if (ni->ni_flags & IEEE80211_NODE_VHT)
 		bss.basic.phymode |= (1U << 5); /* AC */
+	if ((ni->ni_flags & IEEE80211_NODE_HE) && sc->sc_he_enabled)
+		bss.basic.phymode |= (1U << 6); /* AX */
 	bss.basic.nonht_basic_phy = htole16(is_2g ?
 	    PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP : PHY_TYPE_BIT_OFDM);
 	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss, sizeof(bss));
@@ -7766,6 +9029,11 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	    associated, ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0), ni->ni_intval, ni->ni_dtimperiod, rv);
 	if (rv != 0 || !associated)
 		return rv;
+	if ((ni->ni_flags & IEEE80211_NODE_HE) && sc->sc_he_enabled) {
+		rv = mwx_send_bss_he_info(sc, ni);
+		if (rv != 0)
+			return rv;
+	}
 
 	channel.bss_idx = mvif->idx;
 	channel.rlm.tag = htole16(UNI_BSS_INFO_RLM);
@@ -7804,6 +9072,9 @@ MtkMwx::suspend()
 	struct ifnet *ifp;
 
 	if (sc == NULL || sc->sc_suspended)
+		return;
+	MwxRxAmsduTransition transition(sc);
+	if (!transition.ok())
 		return;
 	ifp = &sc->sc_ic.ic_if;
 	MWX_DEV_LOG(sc, "suspend flags=0x%x fw_loaded=%d\n", ifp->if_flags,
@@ -7868,6 +9139,12 @@ MtkMwx::debugPoll()
 	    sc->sc_suspended)
 		return;
 	ic = &sc->sc_ic;
+	mwx_rx_refill_retry(sc);
+	if (sc->sc_rx_amsdu_enabled) {
+		uint64_t now_ns = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+		mwx_rx_amsdu_expire(sc, now_ns / 1000000);
+	}
 	polls++;
 
 	/*
@@ -7975,14 +9252,67 @@ MtkMwx::debugPoll()
 		    mwx_rx_bar_cnt);
 	if (verbose)
 		MWX_DEV_LOG(sc,
-		    "tx txwi_free=%u ring_free=%d full=%u oactive=%d tx_ba=%u amsdu=%d\n",
+		    "tx output_start=%u noqueue=%u active=%u capacity=%u dequeue_fail=%u post_active=%u other=%u kick=%u txwi_free=%u ring_free=%d full=%u oactive=%d tx_ba=%u amsdu=%d\n",
+		    sc->sc_output_start_cnt, sc->sc_output_noqueue_cnt,
+		    sc->sc_output_active_cnt, sc->sc_output_capacity_cnt,
+		    sc->sc_output_dequeue_fail_cnt, sc->sc_output_post_active_cnt,
+		    sc->sc_output_kick_fail_cnt, sc->sc_tx_kick_cnt,
 		    sc->sc_txwi.mt_nfree, mwx_dma_free_slots(&sc->sc_txq),
 		    sc->sc_tx_full_cnt, ifq_is_oactive(&ic->ic_if.if_snd) ? 1 : 0,
 		    ic->ic_stats.is_ht_tx_ba_agreements, sc->sc_tx_amsdu);
+	if (polls % 30 == 0) {
+		MWX_DEV_LOG(sc,
+		    "rxdma cumulative bytes=%llu copy_bytes=%llu copy_saved=%llu batches=%llu desc=%llu max_batch=%u bad_len=%u refill_fail=%u refill_recover=%u pending=%u/%u/%u\n",
+		    (unsigned long long)sc->sc_rx_dma_bytes,
+		    (unsigned long long)sc->sc_rx_dma_copy_bytes,
+		    (unsigned long long)sc->sc_rx_dma_copy_saved,
+		    (unsigned long long)sc->sc_rx_dma_batches,
+		    (unsigned long long)sc->sc_rx_dma_desc,
+		    sc->sc_rx_dma_max_batch, sc->sc_rx_dma_bad_len, sc->sc_rx_refill_fail,
+		    sc->sc_rx_refill_recover, sc->sc_rxq.mq_refill_pending,
+		    sc->sc_rxmcuq.mq_refill_pending, sc->sc_rxfwdlq.mq_refill_pending);
+		MWX_DEV_LOG(sc,
+		    "rxpool disabled=%u total=%u free=%u allocs=%u exhausted=%u fallbacks=%u returned=%u\n",
+		    sc->sc_rx_pool_disabled, sc->sc_rx_pool_total,
+		    sc->sc_rx_pool_free_cnt, sc->sc_rx_pool_allocs,
+		    sc->sc_rx_pool_exhausted, sc->sc_rx_pool_fallbacks,
+		    sc->sc_rx_pool_returned);
+		MWX_DEV_LOG(sc,
+		    "rxchain cumulative completed=%llu resumed=%llu dropped=%llu held_bytes=%u/%u/%u held_segs=%u/%u/%u\n",
+		    (unsigned long long)sc->sc_rx_dma_chain_completed,
+		    (unsigned long long)sc->sc_rx_dma_chain_resumed,
+		    (unsigned long long)sc->sc_rx_dma_chain_dropped,
+		    sc->sc_rxq.mq_rx_bytes, sc->sc_rxmcuq.mq_rx_bytes,
+		    sc->sc_rxfwdlq.mq_rx_bytes, sc->sc_rxq.mq_rx_segments,
+		    sc->sc_rxmcuq.mq_rx_segments, sc->sc_rxfwdlq.mq_rx_segments);
+		MWX_DEV_LOG(sc,
+		    "rxinput cumulative batches=%llu packets=%llu max_batch=%u\n",
+		    (unsigned long long)sc->sc_rx_input_batches,
+		    (unsigned long long)sc->sc_rx_input_packets,
+		    sc->sc_rx_input_max_batch);
+		const MtkRxAmsduStats as = mwx_rx_amsdu_stats(sc);
+		MWX_DEV_LOG(sc,
+		    "rxamsdu cumulative enabled=%d started=%llu completed=%llu subframes=%llu singleton=%llu orphan=%llu mismatch=%llu invalid=%llu timeout=%llu allocfail=%llu pending=%llu\n",
+		    sc->sc_rx_amsdu_enabled, as.started, as.completed, as.subframes,
+		    as.singleton, as.orphan, as.mismatch, as.invalid, as.timeout,
+		    as.allocfail, as.pending);
+		MtkRxAmpduStats &a = sc->sc_rx_ampdu_stats;
+		MWX_DEV_LOG(sc,
+		    "rxampdu observed completed=%llu mpdu=%llu max=%u bins[1=%llu 2-3=%llu 4-7=%llu 8-15=%llu 16-31=%llu 32+=%llu] non_ampdu=%llu missing_group2=%llu deagg_excluded=%llu uncertain=%llu pending=%u\n",
+		    (unsigned long long)a.groups, (unsigned long long)a.mpdus,
+		    a.maximum, (unsigned long long)a.bins[0],
+		    (unsigned long long)a.bins[1], (unsigned long long)a.bins[2],
+		    (unsigned long long)a.bins[3], (unsigned long long)a.bins[4],
+		    (unsigned long long)a.bins[5], (unsigned long long)a.nonAmpdu,
+		    (unsigned long long)a.missingGroup2,
+		    (unsigned long long)a.deaggregated,
+		    (unsigned long long)a.uncertainGroups, a.pending);
+		mtkRxAmpduResetInterval(a);
+	}
 	if (verbose && mwx_rxr_total != 0) {
 		MWX_DEV_LOG(sc,
 		    "rxrate n=%u mode[cck=%u ofdm=%u ht=%u vht=%u he=%u] bw[20=%u 40=%u 80=%u 160=%u] nss[1=%u 2=%u] "
-		    "mcs[0=%u 1=%u 2=%u 3=%u 4=%u 5=%u 6=%u 7=%u 8=%u 9=%u] sgi=%u stbc=%u ldpc=%u\n",
+		    "mcs[0=%u 1=%u 2=%u 3=%u 4=%u 5=%u 6=%u 7=%u 8=%u 9=%u] sgi=%u stbc=%u ldpc=%u he_gi[0.8=%u 1.6=%u 3.2=%u]\n",
 		    mwx_rxr_total, mwx_rxr_mode[0], mwx_rxr_mode[1],
 		    mwx_rxr_mode[2] + mwx_rxr_mode[3], mwx_rxr_mode[4],
 		    mwx_rxr_mode[8] + mwx_rxr_mode[9] + mwx_rxr_mode[10] +
@@ -7992,12 +9322,14 @@ MtkMwx::debugPoll()
 		    mwx_rxr_mcs[0], mwx_rxr_mcs[1], mwx_rxr_mcs[2], mwx_rxr_mcs[3],
 		    mwx_rxr_mcs[4], mwx_rxr_mcs[5], mwx_rxr_mcs[6], mwx_rxr_mcs[7],
 		    mwx_rxr_mcs[8], mwx_rxr_mcs[9], mwx_rxr_sgi, mwx_rxr_stbc,
-		    mwx_rxr_ldpc);
+		    mwx_rxr_ldpc, mwx_rxr_he_gi[0], mwx_rxr_he_gi[1],
+		    mwx_rxr_he_gi[2]);
 		/* per-interval histogram */
 		memset(mwx_rxr_mode, 0, sizeof(mwx_rxr_mode));
 		memset(mwx_rxr_bw, 0, sizeof(mwx_rxr_bw));
 		memset(mwx_rxr_nss, 0, sizeof(mwx_rxr_nss));
 		memset(mwx_rxr_mcs, 0, sizeof(mwx_rxr_mcs));
+		memset(mwx_rxr_he_gi, 0, sizeof(mwx_rxr_he_gi));
 		mwx_rxr_sgi = mwx_rxr_stbc = mwx_rxr_ldpc = mwx_rxr_total = 0;
 	}
 	last_intr_calls = mwx_intr_calls;

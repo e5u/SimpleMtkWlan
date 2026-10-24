@@ -53,6 +53,7 @@ public:
     void suspend() override;
     void resume() override;
     IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
+    void accountOutputStart(uint32_t reason) override;
 
     static bool mwx_match(IOPCIDevice *device);
 
