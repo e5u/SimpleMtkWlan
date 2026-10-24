@@ -103,6 +103,11 @@ void
 ieee80211_begin_bgscan(struct _ifnet *ifp)
 {
     struct ieee80211com *ic = (struct ieee80211com *)ifp;
+#ifdef AIRPORT_WCL
+    // A roam lock suppresses automatic roaming, not WCL cache scans.
+    if (ic->ic_wcl_roam_locked)
+        return;
+#endif
     
     if (ic->ic_state != IEEE80211_S_RUN || ic->ic_mgt_timer != 0)
         return;

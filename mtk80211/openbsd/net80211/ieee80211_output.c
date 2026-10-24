@@ -1268,52 +1268,25 @@ ieee80211_add_vhtcaps(uint8_t *frm, struct ieee80211com *ic)
 uint8_t *
 ieee80211_add_hecaps(uint8_t *frm, struct ieee80211com *ic)
 {
-    uint8_t nss_size, ie_len;
+    uint8_t nss_size, ppe_size;
     uint8_t *orig_pos = frm;
-    
+
     nss_size = ieee80211_he_mcs_nss_size(&ic->ic_he_cap_elem);
-    ie_len = 2 + 1 +
-    sizeof(ic->ic_he_cap_elem) + nss_size +
-    ieee80211_he_ppe_size(ic->ic_ppe_thres[0],
-                  ic->ic_he_cap_elem.phy_cap_info);
-    
+    ppe_size = ieee80211_he_ppe_size(ic->ic_ppe_thres[0],
+        ic->ic_he_cap_elem.phy_cap_info);
+
     *frm++ = IEEE80211_ELEMID_EXTENSION;
-    frm++; /* We'll set the size later below */
+    frm++; /* Set the size after all present fields are copied. */
     *frm++ = IEEE80211_ELEMID_EXT_HE_CAPABILITY;
-    
-    /* Fixed data */
+
     memcpy(frm, &ic->ic_he_cap_elem, sizeof(ic->ic_he_cap_elem));
     frm += sizeof(ic->ic_he_cap_elem);
-    
     memcpy(frm, &ic->ic_he_mcs_nss_supp, nss_size);
     frm += nss_size;
-    
-    /* Check if PPE Threshold should be present */
-    if ((ic->ic_he_cap_elem.phy_cap_info[6] &
-         IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) == 0)
-        return frm;
-    
-    /*
-     * Calculate how many PPET16/PPET8 pairs are to come. Algorithm:
-     * (NSS_M1 + 1) x (num of 1 bits in RU_INDEX_BITMASK)
-     */
-    nss_size = hweight8(ic->ic_ppe_thres[0] &
-             IEEE80211_PPE_THRES_RU_INDEX_BITMASK_MASK);
-    
-    nss_size *= (1 + ((ic->ic_ppe_thres[0] & IEEE80211_PPE_THRES_NSS_MASK) >>
-           IEEE80211_PPE_THRES_NSS_POS));
-    
-    /*
-     * Each pair is 6 bits, and we need to add the 7 "header" bits to the
-     * total size.
-     */
-    nss_size = (nss_size * IEEE80211_PPE_THRES_INFO_PPET_SIZE * 2) + 7;
-    nss_size = DIV_ROUND_UP(nss_size, 8);
-    
-    /* Copy PPE Thresholds */
-    memcpy(frm, &ic->ic_ppe_thres, nss_size);
-    frm += nss_size;
-    
+    if (ppe_size != 0) {
+        memcpy(frm, ic->ic_ppe_thres, ppe_size);
+        frm += ppe_size;
+    }
     orig_pos[1] = (frm - orig_pos) - 2;
     return frm;
 }
@@ -1638,8 +1611,14 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
     if (ic->ic_flags & IEEE80211_F_VHTON)
         frm = ieee80211_add_vhtcaps(frm, ic);
     
-    if (ic->ic_flags & IEEE80211_F_HEON)
+    if (ic->ic_flags & IEEE80211_F_HEON) {
+        uint8_t *he_start = frm;
         frm = ieee80211_add_hecaps(frm, ic);
+        XYLog("HE assoc req len=%zu bytes=", (size_t)(frm - he_start));
+        for (uint8_t *p = he_start; p < frm; p++)
+            XYLog("%02x", *p);
+        XYLog("\n");
+    }
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);

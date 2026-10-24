@@ -729,6 +729,13 @@ ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
              ni->ni_vhtcaps & IEEE80211_VHTCAP_EXT_NSS_BW_MASK) ||
             ((ni->ni_vhtcaps & IEEE80211_VHTCAP_EXT_NSS_BW_MASK) >>
                     IEEE80211_VHTCAP_EXT_NSS_BW_SHIFT > 1));
+    /* ni_vhtcaps normally contains the common capabilities.  Also guard
+     * against a stale/raw peer capability exceeding our own hardware. */
+    support_160 = support_160 && (ic->ic_vhtcaps &
+        (IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_MASK |
+         IEEE80211_VHTCAP_EXT_NSS_BW_MASK));
+    support_80_80 = support_80_80 && (ic->ic_vhtcaps &
+        IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_160_80P80MHZ);
     
     ext_nss_bw_supp = u32_get_bits(ni->ni_vhtcaps,
                       IEEE80211_VHTCAP_EXT_NSS_BW_MASK);
@@ -784,16 +791,28 @@ ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     cf0 = ieee80211_ieee2mhz(ccf0, ni->ni_chan->ic_flags);
     cf1 = ieee80211_ieee2mhz(ccf1, ni->ni_chan->ic_flags);
+    if (ni->ni_vht_chanwidth != IEEE80211_VHT_CHANWIDTH_USE_HT && !ccf0)
+        return;
+    /* A previous 80+80 association must not leave a second center behind. */
+    ni->ni_chan->ic_center_freq2 = 0;
     
     switch (ni->ni_vht_chanwidth) {
         case IEEE80211_VHT_CHANWIDTH_80P80MHZ:
-            ni->ni_chw = IEEE80211_CHAN_WIDTH_80P80;
+            ni->ni_chw = support_80_80 ? IEEE80211_CHAN_WIDTH_80P80 :
+                IEEE80211_CHAN_WIDTH_80;
             ni->ni_chan->ic_center_freq1 = cf0;
-            ni->ni_chan->ic_center_freq2 = cf1;
+            if (support_80_80)
+                ni->ni_chan->ic_center_freq2 = cf1;
             break;
         case IEEE80211_VHT_CHANWIDTH_160MHZ:
-            ni->ni_chw = IEEE80211_CHAN_WIDTH_160;
+            /* Legacy width=2 puts the 160 MHz center in CCFS0.  CCFS1
+             * is normally zero; revised width=1 is handled below. */
+            ni->ni_chw = support_160 ? IEEE80211_CHAN_WIDTH_160 :
+                IEEE80211_CHAN_WIDTH_80;
             ni->ni_chan->ic_center_freq1 = cf0;
+            if (!support_160)
+                ni->ni_chan->ic_center_freq1 +=
+                    ni->ni_chan->ic_freq > cf0 ? 40 : -40;
             break;
         case IEEE80211_VHT_CHANWIDTH_80MHZ:
             ni->ni_chw = IEEE80211_CHAN_WIDTH_80;
@@ -852,7 +871,7 @@ ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     ni->ni_flags |= IEEE80211_NODE_HE;
     
-    if (!(htole32(ni->ni_he_oper_params) & IEEE80211_HE_OPERATION_VHT_OPER_INFO))
+    if (!(ni->ni_he_oper_params & IEEE80211_HE_OPERATION_VHT_OPER_INFO))
         return;
     
     support_160 = (ni->ni_vhtcaps & (IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_MASK |

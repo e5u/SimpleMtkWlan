@@ -1207,6 +1207,16 @@ ieee80211_node_switch_bss(struct ieee80211com *ic, struct ieee80211_node *ni)
     struct ieee80211_node *curbs, *selbs;
     
     splassert(IPL_NET);
+
+#ifdef AIRPORT_WCL
+    // A lock may arrive after the background roam was queued.
+    if (ic->ic_state == IEEE80211_S_RUN && ic->ic_wcl_roam_locked) {
+        ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+        ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
+        free(sba);
+        return;
+    }
+#endif
     
     if ((ic->ic_flags & IEEE80211_F_BGSCAN) == 0) {
         free(sba);
@@ -1421,6 +1431,9 @@ ieee80211_end_scan(struct _ifnet *ifp)
                   ic->ic_state == IEEE80211_S_RUN);
     int roamscan = bgscan &&
                 (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
+#ifdef AIRPORT_WCL
+    roamscan = roamscan && !ic->ic_wcl_roam_locked;
+#endif
     
     if (ic->ic_event_handler)
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_SCAN_DONE, NULL);
@@ -2828,16 +2841,24 @@ ieee80211_setup_hecaps(struct ieee80211_node *ni, const uint8_t *data,
     struct ieee80211_he_cap_elem *he_cap_ie_elem = (struct ieee80211_he_cap_elem *)data;
     uint8_t mcs_nss_size, he_ppe_size, he_total_size;
     
+    /* Validate each variable-length part before reading its first byte. */
+    if (len < sizeof(ni->ni_he_cap_elem))
+        return;
     mcs_nss_size = ieee80211_he_mcs_nss_size(he_cap_ie_elem);
-    he_ppe_size =
-        ieee80211_he_ppe_size(data[sizeof(ni->ni_he_cap_elem) +
-                        mcs_nss_size],
-                      he_cap_ie_elem->phy_cap_info);
-    he_total_size = sizeof(ni->ni_he_cap_elem) + mcs_nss_size +
-            he_ppe_size;
-    
+    he_total_size = sizeof(ni->ni_he_cap_elem) + mcs_nss_size;
     if (len < he_total_size)
         return;
+    he_ppe_size = 0;
+    if (he_cap_ie_elem->phy_cap_info[6] &
+        IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) {
+        if (len == he_total_size)
+            return;
+        he_ppe_size = ieee80211_he_ppe_size(data[he_total_size],
+            he_cap_ie_elem->phy_cap_info);
+        if (he_ppe_size > sizeof(ni->ni_ppe_thres) ||
+            len < he_total_size + he_ppe_size)
+            return;
+    }
     
     memcpy(&ni->ni_he_cap_elem, data, sizeof(ni->ni_he_cap_elem));
     
@@ -2858,7 +2879,10 @@ ieee80211_setup_heop(struct ieee80211_node *ni, const uint8_t *data,
                      uint8_t len)
 {
     struct ieee80211_he_operation *he_op_ie = (struct ieee80211_he_operation *)data;
-    
+
+    if (len < sizeof(*he_op_ie) ||
+        len + 1 < ieee80211_he_oper_size(data))
+        return 0;
     ni->ni_he_oper_params = le32toh(he_op_ie->he_oper_params);
     ni->ni_he_oper_nss_set = le16toh(he_op_ie->he_mcs_nss_set);
     bzero(&ni->ni_he_optional, sizeof(ni->ni_he_optional));

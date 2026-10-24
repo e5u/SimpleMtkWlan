@@ -185,7 +185,7 @@ ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
 
    k = ieee80211_get_rxkey(ic, m, ni);
    if (k == NULL)
-       return NULL;
+       goto fail;
 
    wh = mtod(m, struct ieee80211_frame *);
    hdrlen = ieee80211_get_hdrlen(wh);
@@ -210,15 +210,15 @@ ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
            break;
        }
            if (ieee80211_ccmp_get_pn(&pn, &prsc, m, k) != 0)
-               return NULL;
+               goto fail;
            if (rxi->rxi_flags & IEEE80211_RXI_HWDEC_SAME_PN) {
                if (pn < *prsc) {
                    ic->ic_stats.is_ccmp_replays++;
-                   return NULL;
+                   goto fail;
                }
            } else if (pn <= *prsc) {
                ic->ic_stats.is_ccmp_replays++;
-               return NULL;
+               goto fail;
            }
 
        /* Update last-seen packet number. */
@@ -240,16 +240,16 @@ ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
            break;
        }
        if (ieee80211_tkip_get_tsc(&pn, &prsc, m, k) != 0)
-           return NULL;
+           goto fail;
 
        if (rxi->rxi_flags & IEEE80211_RXI_HWDEC_SAME_PN) {
            if (pn < *prsc) {
                ic->ic_stats.is_tkip_replays++;
-               return NULL;
+               goto fail;
                }
            } else if (pn <= *prsc) {
            ic->ic_stats.is_tkip_replays++;
-           return NULL;
+           goto fail;
        }
 
        /* Update last-seen packet number. */
@@ -267,6 +267,11 @@ ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
    }
 
    return m;
+
+fail:
+   /* The input caller replaces its sole reference with our return value. */
+   mbuf_freem(m);
+   return NULL;
 }
 
 /*
@@ -1306,29 +1311,28 @@ ieee80211_amsdu_decap(struct ieee80211com *ic, mbuf_t m,
     int len, pad, mcast;
     struct ieee80211_frame *wh;
     struct mbuf_list subframes = MBUF_LIST_INITIALIZER();
-    
+
     wh = mtod(m, struct ieee80211_frame *);
     mcast = IEEE80211_IS_MULTICAST(wh->i_addr1);
-    
+
     /* strip 802.11 header */
     mbuf_adj(m, hdrlen);
-    
-    while (mbuf_pkthdr_len(m) >= ETHER_HDR_LEN + LLC_SNAPFRAMELEN) {
-        /* process an A-MSDU subframe */
-        mbuf_pullup(&m, ETHER_HDR_LEN + LLC_SNAPFRAMELEN);
-        if (m == NULL)
-            break;
+
+    while (m != NULL) {
+        /* Reject a truncated tail atomically, including earlier subframes. */
+        if (mbuf_pkthdr_len(m) < ETHER_HDR_LEN + LLC_SNAPFRAMELEN)
+            goto fail;
+        /* On failure the KPI frees the chain and sets m to NULL. */
+        if (mbuf_pullup(&m, ETHER_HDR_LEN + LLC_SNAPFRAMELEN) != 0)
+            goto fail;
         eh = mtod(m, struct ether_header *);
         /* examine 802.3 header */
         len = ntohs(eh->ether_type);
-        if (len < LLC_SNAPFRAMELEN) {
-            DPRINTF(("A-MSDU subframe too short (%d)\n", len));
-            /* stop processing A-MSDU subframes */
-            ic->ic_stats.is_rx_decap++;
-            ml_purge(&subframes);
-            mbuf_freem(m);
-            return;
-        }
+        if (len < LLC_SNAPFRAMELEN ||
+            ETHER_HDR_LEN + len > mbuf_pkthdr_len(m))
+            goto fail;
+        /* Padding is based on the original subframe, before LLC removal. */
+        pad = (-(ETHER_HDR_LEN + len)) & 3;
         llc = (struct llc *)&eh[1];
         /* Examine the 802.2 LLC header after the A-MSDU header. */
         if (llc->llc_dsap == LLC_SNAP_LSAP &&
@@ -1346,44 +1350,36 @@ ieee80211_amsdu_decap(struct ieee80211com *ic, mbuf_t m,
             len -= LLC_SNAPFRAMELEN;
         }
         len += ETHER_HDR_LEN;
-        if (len > mbuf_pkthdr_len(m)) {
-            /* stop processing A-MSDU subframes */
-            DPRINTF(("A-MSDU subframe too long (%d)\n", len));
-            ic->ic_stats.is_rx_decap++;
-            ml_purge(&subframes);
-            mbuf_freem(m);
-            return;
-        }
-        
-        /* "detach" our A-MSDU subframe from the others */
-        mbuf_split(m, len, MBUF_DONTWAIT, &n);
-        if (n == NULL) {
-            /* stop processing A-MSDU subframes */
-            ic->ic_stats.is_rx_decap++;
-            ml_purge(&subframes);
-            mbuf_freem(m);
-            return;
-        }
-        
+
+        /* A final subframe needs no split or empty-tail allocation. */
+        n = NULL;
+        if (len < mbuf_pkthdr_len(m) &&
+            mbuf_split(m, len, MBUF_DONTWAIT, &n) != 0)
+            goto fail;
+
         if (ieee80211_amsdu_decap_validate(ic, m, ni)) {
-            /* stop processing A-MSDU subframes */
-            ic->ic_stats.is_rx_decap++;
-            ml_purge(&subframes);
-            mbuf_freem(m);
-            return;
+            /* A successful split transferred the remaining chain to n. */
+            mbuf_freem(n);
+            goto fail;
         }
-        
+
         ml_enqueue(&subframes, m);
-        
         m = n;
-        /* remove padding */
-        pad = ((len + 3) & ~3) - len;
-        mbuf_adj(m, pad);
+        if (m != NULL) {
+            /* Padding is only legal between complete subframes. */
+            if (mbuf_pkthdr_len(m) < pad + ETHER_HDR_LEN + LLC_SNAPFRAMELEN)
+                goto fail;
+            mbuf_adj(m, pad);
+        }
     }
-    
+
     while ((n = ml_dequeue(&subframes)) != NULL)
         ieee80211_enqueue_data(ic, n, ni, mcast, ml);
-    
+    return;
+
+fail:
+    ic->ic_stats.is_rx_decap++;
+    ml_purge(&subframes);
     mbuf_freem(m);
 }
 
@@ -1826,6 +1822,10 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                 }
                 break;
             case IEEE80211_ELEMID_EXTENSION:
+                if (frm[1] < 1) {
+                    ic->ic_stats.is_rx_elem_toosmall++;
+                    break;
+                }
                 switch (frm[2]) {
                     case IEEE80211_ELEMID_EXT_HE_MU_EDCA:
                         break;
@@ -2777,6 +2777,10 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
                 }
                 break;
             case IEEE80211_ELEMID_EXTENSION:
+                if (frm[1] < 1) {
+                    ic->ic_stats.is_rx_elem_toosmall++;
+                    break;
+                }
                 switch (frm[2]) {
                     case IEEE80211_ELEMID_EXT_HE_MU_EDCA:
                         break;
@@ -2837,15 +2841,25 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
         ieee80211_setup_vhtcaps(ic, ni, vhtcap);
         ieee80211_setup_vhtopmode(ni, vhtopmode);
     }
+    int heop_ok = 0;
     if (hecap != NULL && heopmode != NULL) {
+        heop_ok = ieee80211_setup_heop(ni, heopmode + 3, heopmode[1] - 1);
         ieee80211_setup_hecaps(ni, hecap + 3, hecap[1] - 1);
-        ieee80211_setup_heop(ni, heopmode + 3, heopmode[1] - 1);
-    }
+        XYLog("HE assoc resp cap_len=%u op_len=%u op_ok=%d params=0x%08x vhtinfo=%d he_flags=0x%08x\n",
+            hecap ? hecap[1] : 0, heopmode ? heopmode[1] : 0,
+            heop_ok, ni->ni_he_oper_params,
+            !!(ni->ni_he_oper_params & IEEE80211_HE_OPERATION_VHT_OPER_INFO),
+            ni->ni_flags);
+    } else
+        XYLog("HE assoc resp missing cap=%d op=%d\n", hecap != NULL, heopmode != NULL);
 
     ieee80211_ht_negotiate(ic, ni);
     ieee80211_vht_negotiate(ic, ni);
     if (hecap != NULL && heopmode != NULL) {
         ieee80211_he_negotiate(ic, ni);
+        XYLog("HE negotiate result he=%d chw=%d vht=%d mode=%u\n",
+            !!(ni->ni_flags & IEEE80211_NODE_HE), ni->ni_chw,
+            !!(ni->ni_flags & IEEE80211_NODE_VHT), ic->ic_curmode);
     }
     
     /* Hop into 11n/11ac/11ax mode after associating to an HT AP in a legacy mode. */
@@ -3274,6 +3288,14 @@ ieee80211_recv_addba_resp(struct ieee80211com *ic, mbuf_t m,
         return;
     }
     
+    /* The peer may accept a smaller window than the one we requested. */
+    if (bufsz == 0 || bufsz > IEEE80211_BA_MAX_WINSZ)
+        bufsz = IEEE80211_BA_MAX_WINSZ;
+    if (ba->ba_winsize == 0 || bufsz < ba->ba_winsize)
+        ba->ba_winsize = bufsz;
+    ba->ba_params &= ~IEEE80211_ADDBA_BUFSZ_MASK;
+    ba->ba_params |= ba->ba_winsize << IEEE80211_ADDBA_BUFSZ_SHIFT;
+
     /*
      * A-MSDU inside the A-MPDUs we send only if the recipient allows it
      * (the bit in its ADDBA response); the driver reads it from ba_params.
