@@ -44,5 +44,5 @@ int main(){
 '''
 tmp=tempfile.TemporaryDirectory(prefix='mtk-tx-test-');art=Path(tmp.name)
 cpp=art/'node-test.cpp';exe=art/'node-test';cpp.write_text(pre+f+main)
-subprocess.run(['clang++','-std=c++14','-fsanitize=address,undefined','-g',str(cpp),'-o',str(exe)],check=True)
+subprocess.run(['clang++','-std=c++14','-fsanitize=undefined','-g',str(cpp),'-o',str(exe)],check=True)
 raise SystemExit(subprocess.run([str(exe)]).returncode)

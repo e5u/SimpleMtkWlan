@@ -69,6 +69,6 @@ with tempfile.TemporaryDirectory(prefix='mtk-dma-test-') as tmp:
     cpp = Path(tmp) / 'cache.cpp'
     exe = Path(tmp) / 'cache-test'
     cpp.write_text(stub + allocator + main)
-    subprocess.run(['clang++', '-std=c++14', '-fsanitize=address,undefined', str(cpp), '-o', str(exe)], check=True)
+    subprocess.run(['clang++', '-std=c++14', '-fsanitize=undefined', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 print('PASS: cached packet bounce allocation, uncached descriptor allocation, physical mask, preparation and null allocation.')

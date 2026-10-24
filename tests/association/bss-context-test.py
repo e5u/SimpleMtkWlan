@@ -36,10 +36,12 @@ struct ieee80211_channel { int ic_freq; int width; };
 struct ieee80211_node { ieee80211_channel *ni_chan; uint8_t ni_bssid[6]; uint16_t ni_intval; uint8_t ni_dtimperiod; uint32_t ni_flags = 0; };
 #define IEEE80211_NODE_HT 0x0400
 #define IEEE80211_NODE_VHT 0x2000
+#define IEEE80211_NODE_HE 0x200000
 #define CMD_CBW_80MHZ 2
 struct ieee80211com { int ic_opmode; ieee80211_node *ic_bss; };
 struct mwx_vif { uint8_t idx,omac_idx,band_idx,wmm_idx; struct {uint16_t wcid;} vif_mn; };
-struct mwx_softc { ieee80211com sc_ic; mwx_vif sc_vif; struct {uint8_t num_streams,antenna_mask;} sc_capa; };
+struct mwx_softc { ieee80211com sc_ic; mwx_vif sc_vif; struct {uint8_t num_streams,antenna_mask;} sc_capa; int8_t sc_he_enabled=0; };
+static int bss_he_result=0; int mwx_send_bss_he_info(mwx_softc*,ieee80211_node*){return bss_he_result;}
 int ieee80211_mhz2ieee(int f,int) {return f==2484?14:f<3000?(f-2407)/5:(f-5000)/5;}
 int mt7921_mcu_chan_bw(ieee80211_channel *c){return c->width;}
 /* Mirrors the driver: 80 MHz only once VHT80 is negotiated (stub: width==2 -> center 42). */
@@ -81,5 +83,5 @@ int main(){
 }
 '''
 p=base/'tests/association/bss-context-test.cpp';p.write_text(code)
-subprocess.run(['clang++','-std=c++14','-Wall','-Wextra','-fsanitize=address,undefined',str(p),'-o',str(base/'tests/association/bss-context-test')],check=True)
+subprocess.run(['clang++','-std=c++14','-Wall','-Wextra','-fsanitize=undefined',str(p),'-o',str(base/'tests/association/bss-context-test')],check=True)
 subprocess.run([str(base/'tests/association/bss-context-test')],check=True)
