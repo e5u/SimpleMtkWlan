@@ -116,6 +116,16 @@ int pci_intr_map(struct pci_attach_args *paa, pci_intr_handle_t *ih) {
 	return pci_intr_map_msi(paa, ih);
 }
 
+static bool interruptFilter(OSObject *, IOFilterInterruptEventSource *);
+static void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count);
+static bool
+interruptFilter(OSObject *, IOFilterInterruptEventSource *)
+{
+	/* Let IOKit own primary-to-secondary dispatch; the driver can also call
+	 * signalInterrupt() after bounding one RX work item. */
+	return true;
+}
+
 void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count);
 void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count) {
 	pci_intr_handle* _ih = OSDynamicCast(pci_intr_handle, ih);
@@ -143,7 +153,8 @@ void* pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, 
 			break;
 		}
 	}
-	ih->intr = IOInterruptEventSource::interruptEventSource(ih, &interruptTrampoline, ih->dev, intIndex);
+	ih->intr = IOFilterInterruptEventSource::filterInterruptEventSource(
+	    ih, &interruptTrampoline, &interruptFilter, ih->dev, intIndex);
 	mtk_dbg_log("SimpleMtkWlan: interrupt source index=%d (%s)\n", intIndex,
 	    intIndex ? "msi" : "intx");
 	
@@ -158,6 +169,13 @@ void* pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, 
 
 void* pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, int (*handler)(void *), void *arg, const char *name) {
 	return pci_intr_establish(pc, ih, level, handler, arg);
+}
+
+void pci_intr_reschedule(pci_chipset_tag_t pc, void *ih) {
+	(void)pc;
+	pci_intr_handle_t intr = (pci_intr_handle_t)ih;
+	if (intr != NULL && intr->intr != NULL)
+		intr->intr->signalInterrupt();
 }
 
 void pci_intr_disestablish(pci_chipset_tag_t pc, void *ih) {

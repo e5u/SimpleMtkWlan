@@ -30,6 +30,9 @@ public:
     virtual void clearScanningFlags() = 0;
     
     virtual IOReturn setMulticastList(IOEthernetAddress *addr, int count) = 0;
+    
+    /* Output scheduling diagnostics; used only by the native Airport front end. */
+    virtual void accountOutputStart(uint32_t reason) = 0;
 };
 
 #endif /* MtkDriverController_h */

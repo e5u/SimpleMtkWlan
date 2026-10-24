@@ -59,6 +59,8 @@ public:
     virtual MtkDriverInfo *getDriverInfo() = 0;
     
     virtual MtkDriverController *getDriverController() = 0;
+    /* Output scheduling diagnostics; implemented by the MediaTek HAL. */
+    virtual void accountOutputStart(uint32_t reason) { (void)reason; }
     
     /* Periodic hardware state dump / interrupt poll, called on the main work loop. */
     virtual void debugPoll() {}

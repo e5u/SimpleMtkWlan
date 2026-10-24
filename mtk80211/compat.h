@@ -33,6 +33,7 @@
 
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -178,7 +179,7 @@ class pci_intr_handle : public OSObject {
 	OSDeclareDefaultStructors(pci_intr_handle)
 public:
 	IOWorkLoop*		workloop;
-	IOInterruptEventSource*	intr;
+	IOFilterInterruptEventSource* intr;
 	IOPCIDevice*		dev;
 	int (*func)(void* arg);
 	void* arg;
@@ -290,6 +291,7 @@ int		pci_intr_map(struct pci_attach_args *paa, pci_intr_handle_t *ih);
 void*		pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, int (*handler)(void *), void *arg);
 void*		pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, int (*handler)(void *), void *arg, const char *name);
 void		pci_intr_disestablish(pci_chipset_tag_t pc, void *ih);
+void		pci_intr_reschedule(pci_chipset_tag_t pc, void *ih);
 const char	*pci_intr_string(pci_chipset_tag_t pc, pci_intr_handle_t ih);
 
 uint64_t    bus_space_read_8(bus_space_tag_t space, bus_space_handle_t handle, bus_size_t offset);
