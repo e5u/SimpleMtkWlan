@@ -52,5 +52,5 @@ int main(int argc,char**argv){
 '''
 tmp=tempfile.TemporaryDirectory(prefix='mtk-tx-test-');art=Path(tmp.name)
 cpp=art/'free-test.cpp';exe=art/'free-test';cpp.write_text(pre+f+main)
-subprocess.run(['clang++','-std=c++14','-fsanitize=undefined','-g',str(cpp),'-o',str(exe)],check=True)
+subprocess.run(['clang++','-std=c++14','-fsanitize=' + __import__('os').environ.get('MTK_TEST_SANITIZERS', 'address,undefined'),'-g',str(cpp),'-o',str(exe)],check=True)
 raise SystemExit(subprocess.run([str(exe)]+(['baseline'] if len(sys.argv)>2 else [])).returncode)

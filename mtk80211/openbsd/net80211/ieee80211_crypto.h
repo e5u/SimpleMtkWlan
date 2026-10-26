@@ -67,7 +67,8 @@ enum ieee80211_akm {
 	IEEE80211_AKM_8021X		= 0x00000001,
 	IEEE80211_AKM_PSK		= 0x00000002,
 	IEEE80211_AKM_SHA256_8021X	= 0x00000004,	/* 11w */
-	IEEE80211_AKM_SHA256_PSK	= 0x00000008	/* 11w */
+	IEEE80211_AKM_SHA256_PSK	= 0x00000008,	/* 11w */
+	IEEE80211_AKM_SAE		= 0x00000010	/* SAE */
 };
 
 #define IEEE80211_TKIP_HDRLEN	8
@@ -89,6 +90,9 @@ enum ieee80211_akm {
 #define IEEE80211_GCMP_PNLEN        6
 
 #define IEEE80211_PMK_LEN	32
+
+void ieee80211_eapol_key_encrypt(struct ieee80211com *,
+    struct ieee80211_eapol_key *, const u_int8_t *);
 
 #ifdef _KERNEL 
 
@@ -121,7 +125,21 @@ static __inline int
 ieee80211_is_sha256_akm(enum ieee80211_akm akm)
 {
 	return akm == IEEE80211_AKM_SHA256_8021X ||
-	    akm == IEEE80211_AKM_SHA256_PSK;
+	    akm == IEEE80211_AKM_SHA256_PSK || akm == IEEE80211_AKM_SAE;
+}
+
+static __inline u_int16_t
+ieee80211_eapol_key_version(enum ieee80211_akm akm,
+    enum ieee80211_cipher cipher, enum ieee80211_cipher groupcipher)
+{
+	if (akm == IEEE80211_AKM_SAE)
+		return EAPOL_KEY_DESC_V0;
+	if (ieee80211_is_sha256_akm(akm))
+		return EAPOL_KEY_DESC_V3;
+	if (cipher == IEEE80211_CIPHER_CCMP ||
+	    groupcipher == IEEE80211_CIPHER_CCMP)
+		return EAPOL_KEY_DESC_V2;
+	return EAPOL_KEY_DESC_V1;
 }
 
 struct ieee80211_key {
@@ -166,6 +184,11 @@ void	ieee80211_crypto_attach(struct _ifnet *);
 void	ieee80211_crypto_detach(struct _ifnet *);
 
 void	ieee80211_crypto_clear_groupkeys(struct ieee80211com *);
+int	ieee80211_has_igtk(const struct ieee80211com *);
+int	ieee80211_igtk_kde_valid(enum ieee80211_cipher,
+	    const u_int8_t *);
+int	ieee80211_keys_ready(struct ieee80211com *, struct ieee80211_node *);
+int	ieee80211_eapol_key_data_valid(const struct ieee80211_eapol_key *);
 struct	ieee80211_key *ieee80211_get_txkey(struct ieee80211com *,
 	    const struct ieee80211_frame *, struct ieee80211_node *);
 struct	ieee80211_key *ieee80211_get_rxkey(struct ieee80211com *,
@@ -184,10 +207,8 @@ void	ieee80211_eapol_key_mic(struct ieee80211_eapol_key *,
 	    const u_int8_t *);
 int	ieee80211_eapol_key_check_mic(struct ieee80211_eapol_key *,
 	    const u_int8_t *);
-#ifndef IEEE80211_STA_ONLY
 void	ieee80211_eapol_key_encrypt(struct ieee80211com *,
 	    struct ieee80211_eapol_key *, const u_int8_t *);
-#endif
 int	ieee80211_eapol_key_decrypt(struct ieee80211_eapol_key *,
 	    const u_int8_t *);
 
@@ -195,7 +216,8 @@ struct	ieee80211_pmk *ieee80211_pmksa_add(struct ieee80211com *,
 	    enum ieee80211_akm, const u_int8_t *, const u_int8_t *, u_int32_t);
 struct	ieee80211_pmk *ieee80211_pmksa_find(struct ieee80211com *,
 	    struct ieee80211_node *, const u_int8_t *);
-void	ieee80211_derive_ptk(enum ieee80211_akm, const u_int8_t *,
+int	ieee80211_derive_ptk(enum ieee80211_akm, enum ieee80211_cipher,
+	    const u_int8_t *,
 	    const u_int8_t *, const u_int8_t *, const u_int8_t *,
 	    const u_int8_t *, struct ieee80211_ptk *);
 int	ieee80211_cipher_keylen(enum ieee80211_cipher);

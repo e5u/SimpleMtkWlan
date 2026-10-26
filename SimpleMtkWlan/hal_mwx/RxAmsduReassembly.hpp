@@ -12,7 +12,7 @@
  * metadata; caller restores one CCMP header and performs post-reorder replay
  * validation. This helper never delivers packets or changes replay counters. */
 enum { MTK_RX_AMSDU_TIDS = 16, MTK_RX_AMSDU_SUBFRAMES = 64,
-    MTK_RX_AMSDU_MAX_BODY = 3839, MTK_RX_AMSDU_MAX_HEADER = 30,
+    MTK_RX_AMSDU_MAX_BODY = 7935, MTK_RX_AMSDU_MAX_HEADER = 30,
     MTK_RX_AMSDU_TIMEOUT_MS = 100 };
 
 struct MtkRxAmsduMeta {

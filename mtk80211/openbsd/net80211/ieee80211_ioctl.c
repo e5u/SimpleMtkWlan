@@ -325,8 +325,17 @@ int
 ieee80211_ioctl_setwpaparms(struct ieee80211com *ic,
     const struct ieee80211_wpaparams *wpa)
 {
+	u_int32_t supported_akms = IEEE80211_WPA_AKM_PSK |
+	    IEEE80211_WPA_AKM_SHA256_PSK | IEEE80211_WPA_AKM_8021X |
+	    IEEE80211_WPA_AKM_SHA256_8021X;
+
 	if (!(ic->ic_caps & IEEE80211_C_RSN))
 		return ENODEV;
+	if (ic->ic_userflags & IEEE80211_F_WPA3)
+		supported_akms |= IEEE80211_WPA_AKM_SAE;
+	/* An explicitly requested unsupported AKM must not become PSK. */
+	if (wpa->i_enabled && wpa->i_akms && !(wpa->i_akms & supported_akms))
+		return EINVAL;
 
 	if (!wpa->i_enabled) {
 		if (!(ic->ic_flags & IEEE80211_F_RSNON))
@@ -356,6 +365,9 @@ ieee80211_ioctl_setwpaparms(struct ieee80211com *ic,
 		ic->ic_rsnakms |= IEEE80211_AKM_8021X;
 	if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_8021X)
 		ic->ic_rsnakms |= IEEE80211_AKM_SHA256_8021X;
+	if ((wpa->i_akms & IEEE80211_WPA_AKM_SAE) &&
+	    (ic->ic_userflags & IEEE80211_F_WPA3))
+		ic->ic_rsnakms |= IEEE80211_AKM_SAE;
 	if (ic->ic_rsnakms == 0)	/* set to default (PSK) */
 		ic->ic_rsnakms = IEEE80211_AKM_PSK;
 
@@ -413,6 +425,8 @@ ieee80211_ioctl_getwpaparms(struct ieee80211com *ic,
 		wpa->i_akms |= IEEE80211_WPA_AKM_8021X;
 	if (ic->ic_rsnakms & IEEE80211_AKM_SHA256_8021X)
 		wpa->i_akms |= IEEE80211_WPA_AKM_SHA256_8021X;
+	if (ic->ic_rsnakms & IEEE80211_AKM_SAE)
+		wpa->i_akms |= IEEE80211_WPA_AKM_SAE;
 
 	if (ic->ic_rsngroupcipher == IEEE80211_CIPHER_WEP40)
 		wpa->i_groupcipher = IEEE80211_WPA_CIPHER_WEP40;

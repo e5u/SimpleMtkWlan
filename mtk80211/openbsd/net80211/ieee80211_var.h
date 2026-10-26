@@ -82,6 +82,7 @@
 #include <net80211/ieee80211_ioctl.h>		/* for ieee80211_stats */
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_proto.h>
+#include <net80211/ieee80211_sae.h>
 
 #include <IOKit/IOLib.h>
 
@@ -434,6 +435,8 @@ struct ieee80211com {
 	void			(*ic_delete_key)(struct ieee80211com *,
 				    struct ieee80211_node *,
 				    struct ieee80211_key *);
+	int			(*ic_keys_ready)(struct ieee80211com *,
+				    struct ieee80211_node *);
 	int			(*ic_ampdu_tx_start)(struct ieee80211com *,
 				    struct ieee80211_node *, u_int8_t);
 	void			(*ic_ampdu_tx_stop)(struct ieee80211com *,
@@ -448,7 +451,7 @@ struct ieee80211com {
 				    struct ieee80211_node_switch_bss_arg *,
 				    size_t);
 #ifdef AIRPORT_WCL
-    bool ic_wcl_mac_reconfig;
+    uint8_t ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;
     bool ic_wcl_scan_requested;
@@ -544,6 +547,12 @@ struct ieee80211com {
 	u_int8_t		ic_globalcnt[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ic_nonce[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ic_psk[IEEE80211_PMK_LEN];
+	struct ieee80211_sae ic_sae;
+	uint8_t			ic_sae_password[IEEE80211_SAE_MAX_PASSWORD_LEN];
+	uint8_t			ic_sae_password_len;
+	uint8_t			ic_sae_confirm_sent;
+	uint8_t			ic_sae_confirm_ready;
+	uint8_t			ic_sae_pmk_valid;
 	CTimeout*		ic_rsn_timeout;
 	int			ic_tkip_micfail;
 	u_int64_t		ic_tkip_micfail_last_tsc;
@@ -663,6 +672,11 @@ struct ieee80211_ess {
 #define	IEEE80211_F_VHTON	0x20000000	/* CONF: VHT enabled */
 #define IEEE80211_F_DISABLE_BG_AUTO_CONNECT 0x40000000  /* CONF: disable auto connect to wifi when doing backgound scan */
 #define IEEE80211_F_HEON    0x80000000  /* CONF: HE enabled */
+
+/* ic_userflags */
+#define IEEE80211_F_NOVHT	0x00000010
+#define IEEE80211_F_NOHT40	0x00000020
+#define IEEE80211_F_WPA3	0x00000004	/* CONF: experimental SAE */
 
 /* ic_xflags */
 #define	IEEE80211_F_TX_MGMT_ONLY 0x00000001	/* leave data frames on ifq */

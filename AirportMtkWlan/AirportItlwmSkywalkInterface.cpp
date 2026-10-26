@@ -780,6 +780,10 @@ getNSS(struct apple80211_nss_data *data)
 IOReturn AirportItlwmSkywalkInterface::
 setASSOCIATE(struct apple80211_assoc_data *ad)
 {
+    if (!ad) {
+        XYLog("setASSOCIATE null request\n");
+        return kIOReturnBadArgument;
+    }
     XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
           (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
           (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
@@ -793,9 +797,6 @@ setASSOCIATE(struct apple80211_assoc_data *ad)
     struct apple80211_authtype_data auth_type_data;
     struct ieee80211com *ic = fHalService->get80211Controller();
 
-    if (!ad)
-        return kIOReturnError;
-    
     if (ic->ic_state < IEEE80211_S_SCAN)
         return kIOReturnSuccess;
     
@@ -1074,14 +1075,50 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *dat
 #if __IO80211_TARGET == __MAC_15_2
 IOReturn AirportItlwmSkywalkInterface::setMacAddress(ether_addr &address)
 {
-    return instance->setHardwareAddress(&address, IEEE80211_ADDR_LEN);
+    XYLog("setMacAddress ether_addr=%s\n", ether_sprintf(address.octet));
+    IOReturn status = instance->setHardwareAddress(&address, IEEE80211_ADDR_LEN);
+    XYLog("setMacAddress ether_addr result=0x%x\n", status);
+    return status;
 }
 #else
 IOReturn AirportItlwmSkywalkInterface::setMacAddress(mloAddrArray &addresses)
 {
-    return instance->setHardwareAddress(&addresses, IEEE80211_ADDR_LEN);
+    const auto *bytes = reinterpret_cast<const UInt8 *>(&addresses);
+    XYLog("setMacAddress mloAddrArray=%p first=%02x:%02x:%02x:%02x:%02x:%02x\n",
+         &addresses, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+    IOReturn status = instance->setHardwareAddress(&addresses, IEEE80211_ADDR_LEN);
+    XYLog("setMacAddress mloAddrArray result=0x%x\n", status);
+    return status;
 }
 #endif
+
+IOReturn AirportItlwmSkywalkInterface::getPRIVATE_MAC(
+    apple80211_private_mac_data *data)
+{
+    XYLog("getPRIVATE_MAC data=%p -> unsupported\n", data);
+    return kIOReturnUnsupported;
+}
+
+IOReturn AirportItlwmSkywalkInterface::getRANDOMISATION_STATUS(
+    apple80211_mac_randomisation_status *data)
+{
+    XYLog("getRANDOMISATION_STATUS data=%p -> unsupported\n", data);
+    return kIOReturnUnsupported;
+}
+
+IOReturn AirportItlwmSkywalkInterface::setPRIVATE_MAC(
+    apple80211_private_mac_data *data)
+{
+    XYLog("setPRIVATE_MAC data=%p -> unsupported\n", data);
+    return kIOReturnUnsupported;
+}
+
+IOReturn AirportItlwmSkywalkInterface::setSET_MAC_ADDRESS(
+    apple80211_set_mac_address *data)
+{
+    XYLog("setSET_MAC_ADDRESS data=%p -> unsupported\n", data);
+    return kIOReturnUnsupported;
+}
 
 #endif
 

@@ -1427,6 +1427,32 @@ ieee80211_check_wpa_supplicant_failure(struct ieee80211com *ic,
 		ni2->ni_assoc_fail |= ic->ic_bss->ni_assoc_fail;
 }
 
+static int
+ieee80211_sae_prepare_auth(struct ieee80211com *ic, struct ieee80211_node *ni,
+    enum ieee80211_state ostate)
+{
+	if ((ic->ic_userflags & IEEE80211_F_WPA3) &&
+	    ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+		if (ostate == IEEE80211_S_AUTH && ic->ic_sae.pwe_ready &&
+		    IEEE80211_ADDR_EQ(ic->ic_sae.peer_addr, ni->ni_macaddr) &&
+		    IEEE80211_ADDR_EQ(ic->ic_sae.own_addr, ic->ic_myaddr))
+			return 0;
+		ic->ic_sae_pmk_valid = 0;
+		ic->ic_sae_confirm_sent = 0;
+		ic->ic_sae_confirm_ready = 0;
+		ni->ni_flags &= ~(IEEE80211_NODE_PMK | IEEE80211_NODE_PMKID);
+		explicit_bzero(ni->ni_pmk, sizeof(ni->ni_pmk));
+		explicit_bzero(ni->ni_pmkid, sizeof(ni->ni_pmkid));
+		return ieee80211_sae_start(&ic->ic_sae, ic->ic_myaddr,
+		    ni->ni_macaddr, ic->ic_sae_password, ic->ic_sae_password_len);
+	}
+	ieee80211_sae_clear(&ic->ic_sae);
+	ic->ic_sae_pmk_valid = 0;
+	ic->ic_sae_confirm_sent = 0;
+	ic->ic_sae_confirm_ready = 0;
+	return 0;
+}
+
 int
 ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
     int mgt)
@@ -1440,6 +1466,12 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 #endif
 
 	ostate = ic->ic_state;
+	if (nstate == IEEE80211_S_INIT || nstate == IEEE80211_S_SCAN) {
+		ieee80211_sae_clear(&ic->ic_sae);
+		ic->ic_sae_pmk_valid = 0;
+		ic->ic_sae_confirm_sent = 0;
+		ic->ic_sae_confirm_ready = 0;
+	}
 	if (ifp->if_flags & IFF_DEBUG)
 		XYLog("%s: %s -> %s\n", ifp->if_xname,
 		    ieee80211_state_name[ostate], ieee80211_state_name[nstate]);
@@ -1587,6 +1619,10 @@ justcleanup:
 		break;
 	case IEEE80211_S_AUTH:
         ieee80211_clean_sta_bss_node(ic);
+		if (ieee80211_sae_prepare_auth(ic, ni, ostate) != 0) {
+			ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+			break;
+		}
 		if (ostate == IEEE80211_S_RUN)
 			ieee80211_check_wpa_supplicant_failure(ic, ni);
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
@@ -1632,7 +1668,9 @@ justcleanup:
 			case IEEE80211_FC0_SUBTYPE_DEAUTH:
 				/* try to reauth */
 				IEEE80211_SEND_MGMT(ic, ni,
-				    IEEE80211_FC0_SUBTYPE_AUTH, 1);
+				    IEEE80211_FC0_SUBTYPE_AUTH,
+				    ni->ni_rsnakms == IEEE80211_AKM_SAE ?
+				    IEEE80211_AUTH_SAE_COMMIT : IEEE80211_AUTH_OPEN_REQUEST);
 				break;
 			}
 			break;

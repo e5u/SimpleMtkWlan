@@ -106,6 +106,7 @@ void AirportItlwmSkywalkInterface::stopWCL()
         ic->ic_wcl_join_requested = false;
         ic->ic_wcl_scan_requested = false;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+        clearWCLSae();
     }
 }
 
@@ -240,8 +241,17 @@ IOReturn AirportItlwmSkywalkInterface::setWCL_SCAN_ABORT(void *)
 
 IOReturn AirportItlwmSkywalkInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *request)
 {
-    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(1), request);
+    XYLog("setWCL_ASSOCIATE request=%p\n", request);
+    if (!_fCommandGate)
+        return kIOReturnNotReady;
+    IOReturn status = _fCommandGate->runAction(wclCommand, this,
+                                               reinterpret_cast<void *>(1), request);
+    XYLog("setWCL_ASSOCIATE result=0x%x\n", status);
+    return status;
 }
+
+// Do not put the log before the null check; the WCL entry may be called on
+// interfaces that do not have a command gate yet.
 
 #if __IO80211_TARGET == __MAC_15_2
 IOReturn AirportItlwmSkywalkInterface::setWCL_JOIN_ABORT(void *)
@@ -263,10 +273,17 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
     ieee80211com *ic = fHalService->get80211Controller();
+    XYLog("WCL scan begin type=%u ssid_len=%u ssid=%.*s bssid=%s channels=%u\n",
+          scan.type, scan.ssidLength, scan.ssidLength, scan.ssid,
+          ether_sprintf(scan.bssid), scan.channelCount);
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
-    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
+    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN)) {
+        XYLog("WCL scan rejected busy: scan_pending=%u join_pending=%u bgs=%u state=%d\n",
+              scanPending, joinPending,
+              !!(ic->ic_flags & IEEE80211_F_BGSCAN), ic->ic_state);
         return kIOReturnBusy;
+    }
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         return kIOReturnBusy;
     if (scan.channelCount) {
@@ -278,6 +295,11 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         if (!usable)
             return kIOReturnUnsupported;
     }
+    // Scan security records describe the current sweep. Keeping a record from
+    // an older sweep can turn a stale CoreWLAN result into an SAE join after
+    // the SSID has disappeared or moved to another BSSID.
+    memset(wclScanSecurity, 0, sizeof(wclScanSecurity));
+    wclScanSecurityNext = 0;
     scanPending = true;
     scanCompleted = false;
     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
@@ -293,6 +315,8 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     if (ic->ic_state == IEEE80211_S_RUN) {
         ieee80211_begin_cache_bgscan(&ic->ic_if);
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
+            XYLog("WCL scan rejected: HAL did not start scan ssid_len=%u channels=%u\n",
+                  scan.ssidLength, scan.channelCount);
             scanPending = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
@@ -319,10 +343,13 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
 {
     if (!scanPending)
         return;
+    publishRecentWCLNodes();
     scanPending = false;
     scanCompleted = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+    XYLog("WCL scan finish status=0x%x cached=%u\n",
+          unsigned(status), wclScanSecurityNext);
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
 }
 
@@ -332,16 +359,173 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
         finishWCLScan(scanCompleted ? kIOReturnSuccess : kIOReturnTimeout);
 }
 
-void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
+void AirportItlwmSkywalkInterface::rememberWCLScannedNetwork(
+    const AirportWCL::ScannedNetwork &network)
 {
-    if (!node || node->ni_esslen > 32 || !AirportWCL::validIEs(ies, length))
+    for (unsigned i = 0; i < WCLScanSecurityCapacity; ++i) {
+        auto &entry = wclScanSecurity[i];
+        if (entry.ssidLength == network.ssidLength &&
+            memcmp(entry.ssid, network.ssid, network.ssidLength) == 0 &&
+            IEEE80211_ADDR_EQ(entry.bssid, network.bssid)) {
+            if (memcmp(&entry, &network, sizeof(network)) == 0)
+                return;
+            entry = network;
+            XYLog("WCL scan security changed ssid=%.*s bssid=%s sae=%u psk=%u sae_only=%u\n",
+                  network.ssidLength, network.ssid, ether_sprintf(network.bssid),
+                  network.hasSAE, network.hasPSK, network.saeOnly);
+            return;
+        }
+    }
+    wclScanSecurity[wclScanSecurityNext % WCLScanSecurityCapacity] = network;
+    ++wclScanSecurityNext;
+    XYLog("WCL scan security added ssid=%.*s bssid=%s sae=%u psk=%u sae_only=%u\n",
+          network.ssidLength, network.ssid, ether_sprintf(network.bssid),
+          network.hasSAE, network.hasPSK, network.saeOnly);
+}
+
+bool AirportItlwmSkywalkInterface::wclScanWantsSAE(
+    const AirportWCL::JoinRequest &join) const
+{
+    int ssidMatch = -1;
+    for (unsigned i = 0; i < WCLScanSecurityCapacity; ++i) {
+        const auto &entry = wclScanSecurity[i];
+        if (entry.ssidLength == join.ssidLength &&
+            memcmp(entry.ssid, join.ssid, join.ssidLength) == 0) {
+            if (ssidMatch < 0)
+                ssidMatch = int(i);
+            if (IEEE80211_ADDR_EQ(entry.bssid, join.bssid)) {
+                XYLog("WCL scan security exact match ssid_len=%u bssid=%s sae_only=%u\n",
+                      entry.ssidLength, ether_sprintf(entry.bssid),
+                      entry.saeOnly);
+                return entry.saeOnly;
+            }
+        }
+    }
+    if (ssidMatch >= 0 && !memcmp(join.bssid, "\0\0\0\0\0\0", 6)) {
+        const auto &entry = wclScanSecurity[ssidMatch];
+        XYLog("WCL scan security SSID-only match requested=%s found=%s sae_only=%u\n",
+              ether_sprintf(join.bssid), ether_sprintf(entry.bssid),
+              entry.saeOnly);
+        return entry.saeOnly;
+    }
+    XYLog("WCL scan security miss requested ssid_len=%u bssid=%s\n",
+          join.ssidLength, ether_sprintf(join.bssid));
+    return false;
+}
+
+bool AirportItlwmSkywalkInterface::wclScanSecurityContains(
+    const uint8_t *ssid, const uint8_t ssidLength, const uint8_t *bssid) const
+{
+    for (unsigned i = 0; i < WCLScanSecurityCapacity; ++i) {
+        const auto &entry = wclScanSecurity[i];
+        if (entry.ssidLength == ssidLength &&
+            (!ssidLength || memcmp(entry.ssid, ssid, ssidLength) == 0) &&
+            IEEE80211_ADDR_EQ(entry.bssid, bssid))
+            return true;
+    }
+    return false;
+}
+
+void AirportItlwmSkywalkInterface::publishWCLNodeSnapshot(
+    const ieee80211_node *node)
+{
+    if (!node || !node->ni_esslen || node->ni_esslen > IEEE80211_NWID_LEN ||
+        !node->ni_rsnie_tlv || !node->ni_rsnie_tlv_len ||
+        node->ni_rsnie_tlv_len > 0x800 ||
+        !AirportWCL::validIEs(node->ni_rsnie_tlv, node->ni_rsnie_tlv_len) ||
+        !node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC)
         return;
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC)
-        return;
     unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
     if (!channel || channel > 196)
         return;
+
+    size_t length = node->ni_rsnie_tlv_len;
+    size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
+    auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
+    if (!metadata)
+        return;
+    *metadata = {};
+    metadata->ieLength = uint32_t(length);
+    metadata->channelSpec = uint16_t(
+        channel | (IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
+    metadata->channel = channel;
+    metadata->ssidLength = node->ni_esslen;
+    memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
+    memcpy(metadata->bssid, node->ni_bssid, sizeof(metadata->bssid));
+    metadata->rssi = IWM_MIN_DBM + node->ni_rssi;
+    metadata->interval = node->ni_intval;
+    metadata->capability = node->ni_capinfo;
+    metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
+    memcpy(metadata + 1, node->ni_rsnie_tlv, length);
+    if (!(ic->ic_userflags & IEEE80211_F_WPA3))
+        metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
+            reinterpret_cast<uint8_t *>(metadata + 1), length));
+
+    AirportWCL::ScannedNetwork observed = {};
+    memcpy(observed.bssid, node->ni_bssid, sizeof(observed.bssid));
+    observed.ssidLength = node->ni_esslen;
+    memcpy(observed.ssid, node->ni_essid, observed.ssidLength);
+    observed.hasSAE = (node->ni_rsnakms & IEEE80211_AKM_SAE) != 0;
+    observed.hasPSK = (node->ni_rsnakms &
+        (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) != 0;
+    observed.saeOnly = observed.hasSAE && !observed.hasPSK;
+    if (observed.hasPSK)
+        observed.rsnAKMs[observed.rsnAKMCount++] = 2;
+    if (node->ni_rsnakms & IEEE80211_AKM_SHA256_PSK)
+        observed.rsnAKMs[observed.rsnAKMCount++] = 6;
+    if (observed.hasSAE)
+        observed.rsnAKMs[observed.rsnAKMCount++] = 8;
+    rememberWCLScannedNetwork(observed);
+    XYLog("WCL scan recovered cached ssid=%.*s bssid=%s sae=%u psk=%u age=%llums\n",
+          observed.ssidLength, observed.ssid, ether_sprintf(observed.bssid),
+          observed.hasSAE, observed.hasPSK,
+          static_cast<unsigned long long>(airport_up_time() - node->ni_age_ts));
+    size_t messageSize = sizeof(*metadata) + metadata->ieLength;
+    instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize,
+                          true);
+    IOFree(metadata, size);
+}
+
+void AirportItlwmSkywalkInterface::publishRecentWCLNodes()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    uint64_t now = airport_up_time();
+    struct ieee80211_node *node;
+    RB_FOREACH(node, ieee80211_tree, &ic->ic_tree) {
+        if (!node->ni_esslen || now < node->ni_age_ts ||
+            now - node->ni_age_ts > IEEE80211_CACHE_WAIT * 1000)
+            continue;
+        if (wclScanSecurityContains(node->ni_essid, node->ni_esslen,
+                                    node->ni_bssid))
+            continue;
+        publishWCLNodeSnapshot(node);
+    }
+}
+
+void AirportItlwmSkywalkInterface::publishWCLBeacon(
+    const ieee80211_node *node, const uint8_t *ies, size_t length,
+    const uint8_t *frame, size_t frameLength)
+{
+    if (!node)
+        return;
+    if (length > 0x800) {
+        XYLog("WCL scan skip oversized bssid=%s ie_len=%zu\n",
+              ether_sprintf(node->ni_bssid), length);
+        return;
+    }
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC) {
+        XYLog("WCL scan skip invalid channel bssid=%s\n",
+              ether_sprintf(node->ni_bssid));
+        return;
+    }
+    unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
+    if (!channel || channel > 196) {
+        XYLog("WCL scan skip unsupported channel bssid=%s channel=%u\n",
+              ether_sprintf(node->ni_bssid), channel);
+        return;
+    }
     size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
     if (!metadata)
@@ -350,16 +534,33 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->ieLength = uint32_t(length);
     metadata->channelSpec = uint16_t(channel | (IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
     metadata->channel = channel;
-    metadata->ssidLength = node->ni_esslen;
-    memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
-    memcpy(metadata->bssid, node->ni_bssid, 6);
+    AirportWCL::ScannedNetwork observed = {};
+    bool parsed = AirportWCL::parseScannedNetwork(frame, frameLength, observed);
+    if (parsed) {
+        rememberWCLScannedNetwork(observed);
+        metadata->ssidLength = observed.ssidLength;
+        memcpy(metadata->ssid, observed.ssid, observed.ssidLength);
+        memcpy(metadata->bssid, observed.bssid, sizeof(observed.bssid));
+    } else {
+        XYLog("WCL scan parse failed frame_len=%lu type=0x%x node_ssid_len=%u node_bssid=%s\n",
+              frameLength, frameLength ? frame[0] : 0, node->ni_esslen,
+              ether_sprintf(node->ni_bssid));
+        if (!node->ni_esslen || node->ni_esslen > sizeof(metadata->ssid)) {
+            IOFree(metadata, size);
+            return;
+        }
+        metadata->ssidLength = node->ni_esslen;
+        memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
+        memcpy(metadata->bssid, node->ni_bssid, sizeof(metadata->bssid));
+    }
     metadata->rssi = IWM_MIN_DBM + node->ni_rssi;
     metadata->interval = node->ni_intval;
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
     memcpy(metadata + 1, ies, length);
-    metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
-        reinterpret_cast<uint8_t *>(metadata + 1), length));
+    if (!(ic->ic_userflags & IEEE80211_F_WPA3))
+        metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
+            reinterpret_cast<uint8_t *>(metadata + 1), length));
     size_t messageSize = sizeof(*metadata) + metadata->ieLength;
     if (assocNotified && IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID)) {
         wclBssValid = messageSize <= sizeof(wclBssInfo);
@@ -381,6 +582,17 @@ void AirportItlwmSkywalkInterface::clearWCLPMKSA()
         explicit_bzero(pmk, sizeof(*pmk));
         ::free(pmk);
     }
+}
+
+void AirportItlwmSkywalkInterface::clearWCLSae()
+{
+    auto ic = fHalService->get80211Controller();
+    ieee80211_sae_clear(&ic->ic_sae);
+    explicit_bzero(ic->ic_sae_password, sizeof(ic->ic_sae_password));
+    ic->ic_sae_password_len = 0;
+    ic->ic_sae_pmk_valid = 0;
+    ic->ic_sae_confirm_ready = 0;
+    ic->ic_sae_confirm_sent = 0;
 }
 
 IOReturn AirportItlwmSkywalkInterface::setCLEAR_PMKSA_CACHE(void *)
@@ -442,7 +654,9 @@ IOReturn AirportItlwmSkywalkInterface::accessWCLRSN(apple80211_rsn_ie_data *data
 IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *request)
 {
     AirportWCL::JoinRequest join;
-    if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+    XYLog("beginWCLJoin request=%p\n", request);
+    if (!AirportWCL::decodeJoin(request, 0x3e0, join)) {
+        XYLog("WCL join rejected: invalid association request ABI\n");
         return kIOReturnBadArgument;
     }
     return startWCLJoin(join);
@@ -450,15 +664,24 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
 
 IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
 {
-    auto auth = AirportWCL::classifyLegacyAuth(join);
-    XYLog("WCL join ssid_len=%u bssid=%s chanspec=0x%x auth lower=%u upper=0x%x -> %s, key len=%u type=%u%s, rsn_ie len=%u\n",
-          join.ssidLength, ether_sprintf(join.bssid), join.channelSpec, join.lowerAuth, join.upperAuth,
-          AirportWCL::legacyAuthName(auth), join.keyLength, join.keyCipher,
-          AirportWCL::isPassphrase(join) ? " (passphrase)" : "", join.rsnLength);
-    bool personal = auth == AirportWCL::LegacyAuth::Personal;
-    bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
-    bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     ieee80211com *ic = fHalService->get80211Controller();
+    bool observedSAEOnly = wclScanWantsSAE(join);
+    auto auth = AirportWCL::classifyLegacyAuth(join, observedSAEOnly);
+    XYLog("WCL join ssid_len=%u ssid=%.*s bssid=%s chanspec=0x%x auth lower=%u upper=0x%x ext=0x%x -> %s, key len=%u type=%u%s ext_pw_len=%u join_flags=0x%x security_flags=0x%x key_flags=0x%x, rsn_ie len=%u sae_only=%u observed_sae_only=%u\n",
+          join.ssidLength, join.ssidLength, join.ssid, ether_sprintf(join.bssid),
+          join.channelSpec, join.lowerAuth, join.upperAuth, join.extendedAuth,
+          AirportWCL::legacyAuthName(auth), join.keyLength, join.keyCipher,
+          AirportWCL::isPassphrase(join) ? " (passphrase)" : "",
+          join.extendedPasswordLength, join.joinFlags, join.securityFlags,
+          join.keyFlags, join.rsnLength,
+          AirportWCL::rsnForcesSAE(join), observedSAEOnly);
+    bool personal = auth == AirportWCL::LegacyAuth::Personal;
+    auto security = AirportWCL::personalSecurity(join,
+        (ic->ic_userflags & IEEE80211_F_WPA3) != 0, observedSAEOnly);
+    bool sae = personal && security.sae;
+    bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
+    bool supported = auth != AirportWCL::LegacyAuth::Invalid &&
+        (!personal || security.sae || security.psk);
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
@@ -469,9 +692,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         explicit_bzero(&join, sizeof(join));
         joinDeferred = joinPending = true;
         joinTimer->setTimeoutMS(30000);
+        XYLog("WCL join deferred for MAC reconfiguration\n");
         return kIOReturnSuccess;
     }
     if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
+        XYLog("WCL join rejected supported=%u running=%u pending=%u/%u\n",
+              supported, !!(ic->ic_if.if_flags & IFF_RUNNING), joinPending, scanPending);
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
@@ -481,8 +707,14 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
     clearWCLPMKSA();
+    clearWCLSae();
     ic->ic_flags &= ~(IEEE80211_F_AUTO_JOIN | IEEE80211_F_PSK);
     ic->ic_wcl_enterprise = enterprise;
+    if (sae)
+        ic->ic_caps |= IEEE80211_C_MFP;
+    else if (!(ic->ic_userflags & IEEE80211_F_WPA3))
+        ic->ic_caps &= ~IEEE80211_C_MFP;
+    ic->ic_flags &= ~IEEE80211_F_MFPR;
 
     if (personal || enterprise) {
         ieee80211_wpaparams wpa = {};
@@ -492,15 +724,21 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA2 | APPLE80211_AUTHTYPE_WPA2_PSK |
                               APPLE80211_AUTHTYPE_SHA256_PSK | APPLE80211_AUTHTYPE_SHA256_8021X))
             wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
-        if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK))
+        if (security.psk && (join.upperAuth & (APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK)))
             wpa.i_akms |= IEEE80211_WPA_AKM_PSK;
         if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA2))
             wpa.i_akms |= IEEE80211_WPA_AKM_8021X;
-        if (join.upperAuth & APPLE80211_AUTHTYPE_SHA256_PSK)
+        if (security.psk && (join.upperAuth & APPLE80211_AUTHTYPE_SHA256_PSK))
             wpa.i_akms |= IEEE80211_WPA_AKM_SHA256_PSK;
         if (join.upperAuth & APPLE80211_AUTHTYPE_SHA256_8021X)
             wpa.i_akms |= IEEE80211_WPA_AKM_SHA256_8021X;
-        wpa.i_ciphers = IEEE80211_WPA_CIPHER_CCMP | IEEE80211_WPA_CIPHER_TKIP;
+        if (sae) {
+            wpa.i_akms |= IEEE80211_WPA_AKM_SAE;
+            wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
+        }
+        wpa.i_ciphers = IEEE80211_WPA_CIPHER_CCMP;
+        if (!sae || security.psk)
+            wpa.i_ciphers |= IEEE80211_WPA_CIPHER_TKIP;
         if (join.rsnLength >= 8 && join.rsn[0] == IEEE80211_ELEMID_RSN &&
             join.rsn[4] == 0 && join.rsn[5] == 0x0f && join.rsn[6] == 0xac) {
             if (join.rsn[7] == 2) wpa.i_groupcipher = IEEE80211_WPA_CIPHER_TKIP;
@@ -512,17 +750,35 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
             return kIOReturnBadArgument;
         }
         if (personal) {
-            if (AirportWCL::isPassphrase(join)) {
-                char passphrase[33] = {};
-                memcpy(passphrase, join.key, join.keyLength);
-                pbkdf2_sha1(passphrase, join.ssid, join.ssidLength, 4096,
-                            ic->ic_psk, sizeof(ic->ic_psk));
-                explicit_bzero(passphrase, sizeof(passphrase));
-            } else
-                memcpy(ic->ic_psk, join.key, sizeof(ic->ic_psk));
-            ic->ic_flags |= IEEE80211_F_PSK;
-            XYLog("WCL join PSK key check %02x\n",
-                  ieee80211_key_check(ic->ic_psk, sizeof(ic->ic_psk)));
+            if (sae) {
+                const auto passwordLength = join.extendedPasswordLength ?
+                    join.extendedPasswordLength : join.keyLength;
+                const auto password = join.extendedPasswordLength ?
+                    join.extendedPassword : join.key;
+                if (passwordLength > sizeof(ic->ic_sae_password)) {
+                    explicit_bzero(&join, sizeof(join));
+                    return kIOReturnBadArgument;
+                }
+                memcpy(ic->ic_sae_password, password, passwordLength);
+                ic->ic_sae_password_len = passwordLength;
+            }
+            if (security.psk) {
+                if (AirportWCL::isPassphrase(join)) {
+                    char passphrase[33] = {};
+                    memcpy(passphrase, join.key, join.keyLength);
+                    pbkdf2_sha1(passphrase, join.ssid, join.ssidLength, 4096,
+                                ic->ic_psk, sizeof(ic->ic_psk));
+                    explicit_bzero(passphrase, sizeof(passphrase));
+                } else
+                    memcpy(ic->ic_psk, join.key, sizeof(ic->ic_psk));
+                ic->ic_flags |= IEEE80211_F_PSK;
+            }
+            // Once SAE is selected for the association, PMF is mandatory.
+            // This also applies to a transition network when SAE was chosen
+            // over PSK; leaving MFPR clear would advertise an invalid SAE
+            // association capability set.
+            if (sae)
+                ic->ic_flags |= IEEE80211_F_MFPR;
         } else if (join.keyLength == IEEE80211_PMK_LEN) {
             bool cached = true;
             if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA2))
@@ -531,6 +787,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
                 cached = ieee80211_pmksa_add(ic, IEEE80211_AKM_SHA256_8021X, join.bssid, join.key, 0) != nullptr;
             if (!cached) {
                 clearWCLPMKSA();
+                clearWCLSae();
                 explicit_bzero(&join, sizeof(join));
                 return kIOReturnNoMemory;
             }
@@ -574,10 +831,13 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         joinTimer->cancelTimeout();
         ic->ic_wcl_join_requested = false;
         clearWCLPMKSA();
+        clearWCLSae();
         ic->ic_wcl_enterprise = false;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
         return kIOReturnError;
     }
+    XYLog("WCL join started sae=%u psk=%u mfpr=%u\n", sae, security.psk,
+          !!(ic->ic_flags & IEEE80211_F_MFPR));
     return kIOReturnSuccess;
 }
 
@@ -591,6 +851,7 @@ void AirportItlwmSkywalkInterface::resumeWCLJoin()
     joinTimer->cancelTimeout();
     IOReturn status = startWCLJoin(join);
     explicit_bzero(&join, sizeof(join));
+    XYLog("WCL deferred join resume result=0x%x\n", status);
     if (status != kIOReturnSuccess) {
         joinPending = true;
         finishWCLJoin(1, 0, status);
@@ -617,6 +878,7 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
         ieee80211com *ic = fHalService->get80211Controller();
         ic->ic_wcl_join_requested = false;
         clearWCLPMKSA();
+        clearWCLSae();
         ic->ic_wcl_enterprise = false;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
     }
@@ -650,7 +912,9 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+    ic->ic_flags &= ~IEEE80211_F_MFPR;
     clearWCLPMKSA();
+    clearWCLSae();
     ic->ic_wcl_enterprise = false;
     ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID);
     ic->ic_des_esslen = 0;
@@ -713,22 +977,36 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         case IEEE80211_EVT_DRIVER_READY:
         case IEEE80211_EVT_DRIVER_STOPPED: {
             bool ready = code == IEEE80211_EVT_DRIVER_READY;
+            auto restart = AirportWCL::advanceMacRestart(ic->ic_wcl_mac_reconfig, ready);
+            bool restarting = restart == AirportWCL::MacRestartResult::Waiting;
             if (!ready) {
-                finishWCLScan(ic->ic_wcl_mac_reconfig ? kIOReturnAborted : kIOReturnOffline);
-                finishWCLJoin(1, 0, kIOReturnOffline);
+                finishWCLScan(restarting ? kIOReturnAborted : kIOReturnOffline);
                 portAuthorized = false;
                 updateWCLLinkQuality(true);
-                ic->ic_wcl_join_requested = false;
-                clearWCLPMKSA();
-                ic->ic_wcl_enterprise = false;
-                explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+                if (!restarting) {
+                    finishWCLJoin(1, 0, kIOReturnOffline);
+                    ic->ic_wcl_join_requested = false;
+                    clearWCLPMKSA();
+                    clearWCLSae();
+                    ic->ic_wcl_enterprise = false;
+                    explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+                }
             }
             // An address application is requested by WCL itself, not a new
             // adapter reset. Replaying firmware-load events here rotates the
             // scan MAC again and recursively restarts the card.
-            if (AirportWCL::consumeMacReconfiguration(ic->ic_wcl_mac_reconfig, ready)) {
-                if (ready)
+            XYLog("WCL HAL lifecycle ready=%u mac_restart=%d\n", ready,
+                  static_cast<int>(restart));
+            if (restart != AirportWCL::MacRestartResult::None) {
+                if (restart == AirportWCL::MacRestartResult::Complete)
                     resumeWCLJoin();
+                if (restart == AirportWCL::MacRestartResult::Failed) {
+                    AirportWCL::DriverAvailability event = {};
+                    event.version = 3;
+                    event.reason = 0xe0821804;
+                    instance->postMessage(this, AirportWCL::DriverAvailable,
+                                          &event, sizeof(event), true);
+                }
                 break;
             }
             if (ready) {
@@ -787,7 +1065,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             if (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN ||
                 (portAuthorized && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)))
-                publishWCLBeacon(beacon->node, beacon->ies, beacon->length);
+                publishWCLBeacon(beacon->node, beacon->ies, beacon->length,
+                                 beacon->frame, beacon->frame_length);
             if (joinPending && assocNotified && !firstBeaconNotified &&
                 IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)) {
                 AirportWCL::FirstBeaconEvent event = {};
@@ -954,6 +1233,7 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_LOW_LATENCY_INFO(apple80211_low_la
         return kIOReturnBadArgument;
     // No low-latency or P2P session is implemented by this adapter.
     bzero(data, 4);
+    XYLog("WCL low-latency query result=0\n");
     return kIOReturnSuccess;
 }
 

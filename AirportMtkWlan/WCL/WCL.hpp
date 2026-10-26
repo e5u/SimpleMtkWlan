@@ -15,23 +15,40 @@
 
 namespace AirportWCL {
 
-enum class MacUpdate { Invalid, Unchanged, Busy, Change };
+enum class MacUpdate { Invalid, Unchanged, Change };
 inline MacUpdate planMacUpdate(const uint8_t *current, const uint8_t *requested,
-                               size_t length, bool initializing) {
+                               size_t length) {
     if (!current || !requested || length != 6 || (requested[0] & 1))
         return MacUpdate::Invalid;
     uint8_t bits = 0;
     for (unsigned i = 0; i < 6; ++i) bits |= requested[i];
     if (!bits) return MacUpdate::Invalid;
     if (memcmp(current, requested, 6) == 0) return MacUpdate::Unchanged;
-    return initializing ? MacUpdate::Busy : MacUpdate::Change;
+    return MacUpdate::Change;
 }
 
-// Returns true when this is an internal MAC operation, not an adapter reset.
-inline bool consumeMacReconfiguration(bool &pending, bool ready) {
-    if (!pending) return false;
-    if (ready) pending = false;
-    return true;
+// A private-MAC restart produces one intentional STOPPED followed by the
+// result of mwx_init(). Do not mistake the intermediate stop for a dead
+// adapter, but do report a real initialization failure.
+enum MacRestartState : uint8_t {
+    MacRestartNone,
+    MacRestartStopping,
+    MacRestartStarting
+};
+enum class MacRestartResult { None, Waiting, Complete, Failed };
+inline void beginMacRestartInit(uint8_t &state) {
+    if (state != MacRestartNone) state = MacRestartStarting;
+}
+inline MacRestartResult advanceMacRestart(uint8_t &state, bool ready) {
+    if (state != MacRestartStopping && state != MacRestartStarting) {
+        return MacRestartResult::None;
+    }
+    if (!ready && state == MacRestartStopping) {
+        state = MacRestartStarting;
+        return MacRestartResult::Waiting;
+    }
+    state = MacRestartNone;
+    return ready ? MacRestartResult::Complete : MacRestartResult::Failed;
 }
 
 struct HardwareAddress {
@@ -43,7 +60,7 @@ static_assert(sizeof(HardwareAddress) == 12, "HW_ADDR native wire size");
 static_assert(offsetof(HardwareAddress, address) == 4, "HW_ADDR native address offset");
 inline bool copyHardwareAddress(const uint8_t *address, HardwareAddress &out) {
     out = {};
-    if (planMacUpdate(address, address, 6, false) == MacUpdate::Invalid) return false;
+    if (planMacUpdate(address, address, 6) == MacUpdate::Invalid) return false;
     out.version = 1;
     memcpy(out.address, address, 6);
     return true;
@@ -449,12 +466,18 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
 struct JoinRequest {
     uint32_t lowerAuth;
     uint32_t upperAuth;
+    uint32_t extendedAuth;
+    uint16_t joinFlags;
+    uint8_t securityFlags;
+    uint8_t keyFlags;
     uint32_t ssidLength;
     uint8_t ssid[32];
     uint32_t keyLength;
     uint32_t keyCipher;
     uint16_t keyIndex;
     uint8_t key[32];
+    uint32_t extendedPasswordLength;
+    uint8_t extendedPassword[32];
     uint8_t bssid[6];
     uint16_t channelSpec;
     uint16_t rsnLength;
@@ -481,13 +504,141 @@ inline bool validRSNOverride(const uint8_t *ie, size_t length) {
 // A WPA passphrase (8-63 printable characters, at most 32 fit the request)
 // instead of the 32-byte PMK that macOS normally derives itself.
 inline bool isPassphrase(const JoinRequest &j) {
-    if (j.keyLength < 8 || j.keyLength > 32 ||
+    if (j.keyLength < 8 || j.keyLength > sizeof(j.key) ||
         (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)))
         return false;
     for (uint32_t i = 0; i < j.keyLength; ++i)
         if (j.key[i] < 0x20 || j.key[i] > 0x7e)
             return false;
     return true;
+}
+
+// This ABI contains only 32 key bytes. A PMK cannot be used as an SAE
+// password; never reinterpret it, or read the following native fields.
+inline bool isSAEPassword(const JoinRequest &j) {
+    if (j.extendedPasswordLength)
+        return j.extendedPasswordLength <= sizeof(j.extendedPassword);
+    return j.keyLength != 0 && j.keyLength <= sizeof(j.key) &&
+        !(j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7));
+}
+
+// CoreWLAN can omit APPLE80211_AUTHTYPE_WPA3_SAE from the join request even
+// when its selected BSS is SAE-only. The request still carries the BSS RSN IE,
+// so use an unambiguous SAE-only AKM set as a second selection signal.
+inline bool rsnAKMInfo(const uint8_t *ie, size_t length, bool &sae,
+                       bool &psk, bool &other, uint8_t *akms,
+                       uint8_t &akmCount) {
+    sae = psk = other = false;
+    akmCount = 0;
+    if (!ie || length < 12 || ie[0] != 48 ||
+        size_t(ie[1]) + 2 > length)
+        return false;
+    size_t offset = 8;
+    size_t pairwiseCount = read16(ie + offset);
+    offset += 2;
+    if (pairwiseCount > (length - offset) / 4)
+        return false;
+    offset += pairwiseCount * 4;
+    if (length - offset < 2)
+        return false;
+    size_t count = read16(ie + offset);
+    offset += 2;
+    if (!count || count > (length - offset) / 4 || count > 255)
+        return false;
+    akmCount = uint8_t(count);
+    for (size_t i = 0; i < count; ++i) {
+        const uint8_t *suite = ie + offset + i * 4;
+        if (suite[0] != 0 || suite[1] != 0x0f || suite[2] != 0xac) {
+            other = true;
+        } else if (suite[3] == 8) {
+            sae = true;
+            if (akms && i < 8) akms[i] = suite[3];
+        } else if (suite[3] == 2 || suite[3] == 6) {
+            psk = true;
+            if (akms && i < 8) akms[i] = suite[3];
+        } else {
+            other = true;
+            if (akms && i < 8) akms[i] = suite[3];
+        }
+    }
+    return true;
+}
+
+inline bool rsnSAEOnly(const uint8_t *ie, size_t length) {
+    bool sae = false, psk = false, other = false;
+    uint8_t akmCount = 0;
+    if (!rsnAKMInfo(ie, length, sae, psk, other, nullptr, akmCount))
+        return false;
+    return sae && !psk && !other;
+}
+
+inline bool rsnForcesSAE(const JoinRequest &j) {
+    return validRSNOverride(j.rsn, j.rsnLength) && rsnSAEOnly(j.rsn, j.rsnLength);
+}
+
+struct PersonalSecurity {
+    bool sae;
+    bool psk;
+};
+
+inline PersonalSecurity personalSecurity(const JoinRequest &j, bool enableSAE,
+                                         bool observedSAEOnly = false) {
+    const uint32_t psk = (1u << 1) | (1u << 3) | (1u << 10);
+    bool pmk = j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7);
+    bool saeOnly = observedSAEOnly || rsnForcesSAE(j);
+    return {enableSAE && ((j.upperAuth & (1u << 12)) || saeOnly) &&
+        isSAEPassword(j),
+        !saeOnly && (j.upperAuth & psk) && (pmk || isPassphrase(j))};
+}
+
+struct ScannedNetwork {
+    uint8_t bssid[6];
+    uint8_t ssid[32];
+    uint8_t ssidLength;
+    uint8_t rsnAKMs[8];
+    uint8_t rsnAKMCount;
+    bool hasSAE;
+    bool hasPSK;
+    bool saeOnly;
+};
+
+// Parse a beacon/probe-response frame directly. Tahoe can merge virtual BSSes
+// that share a BSSID in net80211's node cache, so ni_essid and ni_rsnakms are
+// not reliable inputs for the WCL scan record.
+inline bool parseScannedNetwork(const uint8_t *frame, size_t length,
+                                ScannedNetwork &out) {
+    if (!frame || length < 36 ||
+        ((frame[0] & 0xfc) != 0x80 && (frame[0] & 0xfc) != 0x50))
+        return false;
+    size_t headerLength = 24 + ((frame[1] & 0x80) ? 4 : 0);
+    size_t offset = headerLength + 12;
+    if (offset > length)
+        return false;
+    out = {};
+    memcpy(out.bssid, frame + 16, sizeof(out.bssid));
+    bool haveSSID = false;
+    while (offset < length) {
+        if (length - offset < 2)
+            return false;
+        size_t size = size_t(frame[offset + 1]) + 2;
+        if (size > length - offset)
+            return false;
+        if (frame[offset] == 0 && !haveSSID) {
+            size_t ssidLength = size - 2;
+            if (!ssidLength || ssidLength > sizeof(out.ssid))
+                return false;
+            out.ssidLength = uint8_t(ssidLength);
+            memcpy(out.ssid, frame + offset + 2, ssidLength);
+            haveSSID = true;
+        } else if (frame[offset] == 48) {
+            bool other = false;
+            if (rsnAKMInfo(frame + offset, size, out.hasSAE, out.hasPSK,
+                           other, out.rsnAKMs, out.rsnAKMCount))
+                out.saeOnly = out.hasSAE && !out.hasPSK && !other;
+        }
+        offset += size;
+    }
+    return haveSSID;
 }
 
 enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise };
@@ -501,7 +652,7 @@ inline const char *legacyAuthName(LegacyAuth auth) {
     }
 }
 
-inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
+inline LegacyAuth classifyLegacyAuth(const JoinRequest &j, bool observedSAEOnly = false) {
     // Values from apple80211_authtype/cipher_type, used by the WCL association request.
     if (!validRSNOverride(j.rsn, j.rsnLength)) return LegacyAuth::Invalid;
     if (j.lowerAuth != 1) return LegacyAuth::Invalid;
@@ -512,13 +663,15 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
             return LegacyAuth::Wep;
         return LegacyAuth::Invalid;
     }
-    const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10);
+    const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10) | (1u << 12);
     const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11);
     if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
-    if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
-    if (j.upperAuth & personal)
-        return (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)) || isPassphrase(j) ?
-            LegacyAuth::Personal : LegacyAuth::Invalid;
+    if ((j.upperAuth & personal) && (j.upperAuth & enterprise))
+        return LegacyAuth::Invalid;
+    if (j.upperAuth & personal) {
+        auto security = personalSecurity(j, true, observedSAEOnly);
+        return security.sae || security.psk ? LegacyAuth::Personal : LegacyAuth::Invalid;
+    }
     if (j.upperAuth & enterprise)
         return (!j.keyLength || (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7))) ?
             LegacyAuth::Enterprise : LegacyAuth::Invalid;
@@ -545,12 +698,27 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     out = {};
     out.lowerAuth = read32(p + 0x10);
     out.upperAuth = read32(p + 0x14);
+    out.extendedAuth = read32(p + 0x18);
     out.ssidLength = ssidLength;
     memcpy(out.ssid, p + 0x20, ssidLength);
     out.keyLength = keyLength;
     out.keyCipher = read32(p + 0x48);
     out.keyIndex = read16(p + 0x4e);
     memcpy(out.key, p + 0x50, keyLength);
+    // Tahoe fills these independently of apple80211_key. They are not
+    // trailing bytes of key[].
+    if (length >= 0x1e2) {
+        out.joinFlags = read16(p + 0x1e0);
+        out.securityFlags = p[0x1e4];
+        out.keyFlags = p[0x1e8];
+    }
+    if (length >= 0x210) {
+        uint32_t extendedLength = read32(p + 0x1ec);
+        if (extendedLength > sizeof(out.extendedPassword))
+            return false;
+        out.extendedPasswordLength = extendedLength;
+        memcpy(out.extendedPassword, p + 0x1f0, extendedLength);
+    }
     memcpy(out.bssid, p + 0x21c, 6);
     out.channelSpec = read16(p + 0x228);
     out.rsnLength = rsnLength;

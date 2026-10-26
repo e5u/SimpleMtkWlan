@@ -136,7 +136,8 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     /* check packet body length */
     bodylen = BE_READ_2(key->len);
     totlen = 4 + bodylen;
-    if (mbuf_pkthdr_len(m) < totlen || totlen > MCLBYTES)
+    if (totlen < sizeof(*key) || mbuf_pkthdr_len(m) < totlen ||
+        totlen > MCLBYTES)
         goto done;
     
     /* check key data length */
@@ -146,19 +147,12 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     
     info = BE_READ_2(key->info);
     
-    /* discard EAPOL-Key frames with an unknown descriptor version */
+    /* Descriptor version is selected by the negotiated AKM and cipher. */
     desc = info & EAPOL_KEY_VERSION_MASK;
-    if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
+    if (desc != ieee80211_eapol_key_version(
+        (enum ieee80211_akm)ni->ni_rsnakms, ni->ni_rsncipher,
+        ni->ni_rsngroupcipher))
         goto done;
-    
-    if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
-        if (desc != EAPOL_KEY_DESC_V3)
-            goto done;
-    } else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
-               ni->ni_rsngroupcipher == IEEE80211_CIPHER_CCMP) {
-        if (desc != EAPOL_KEY_DESC_V2)
-            goto done;
-    }
     
     /* make sure the key data field is contiguous */
     if (mbuf_len(m) < totlen && mbuf_pullup(&m, totlen)) {
@@ -273,22 +267,23 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
             return;
         }
         memcpy(ni->ni_pmk, pmk->pmk_key, IEEE80211_PMK_LEN);
+    } else if (ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+        if (!ic->ic_sae_pmk_valid || !ic->ic_sae.confirmed ||
+            !IEEE80211_ADDR_EQ(ic->ic_sae.peer_addr, ni->ni_macaddr))
+            return;
+        memcpy(ni->ni_pmk, ic->ic_sae.pmk, IEEE80211_PMK_LEN);
+        if (pmkid != NULL && memcmp(&pmkid[6], ic->ic_sae.pmkid,
+            IEEE80211_PMKID_LEN) != 0)
+            return;
     } else    /* use pre-shared key */
         memcpy(ni->ni_pmk, ic->ic_psk, IEEE80211_PMK_LEN);
     ni->ni_flags |= IEEE80211_NODE_PMK;
 
-    /*
-     * An authenticator repeats message 1 when it could not verify our
-     * message 2, which almost always means a different key (Wi-Fi password).
-     */
     if (ni->ni_rsn_supp_state == RSNA_SUPP_PTKNEGOTIATING)
-        XYLog("4-way msg 1/4 repeated by %s: it rejected our msg 2/4 (wrong key or Wi-Fi password?), key check %02x\n",
-              ether_sprintf(ni->ni_macaddr),
-              ieee80211_key_check(ni->ni_pmk, IEEE80211_PMK_LEN));
+        XYLog("4-way msg 1/4 repeated by %s\n",
+              ether_sprintf(ni->ni_macaddr));
     else
-        XYLog("4-way msg 1/4 from %s, key check %02x\n",
-              ether_sprintf(ni->ni_macaddr),
-              ieee80211_key_check(ni->ni_pmk, IEEE80211_PMK_LEN));
+        XYLog("4-way msg 1/4 from %s\n", ether_sprintf(ni->ni_macaddr));
     
     /* save authenticator's nonce (ANonce) */
     memcpy(ni->ni_nonce, key->nonce, EAPOL_KEY_NONCE_LEN);
@@ -297,8 +292,10 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     arc4random_buf(ic->ic_nonce, EAPOL_KEY_NONCE_LEN);
     
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
-                         ic->ic_myaddr, ni->ni_nonce, ic->ic_nonce, &tptk);
+    if (ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms,
+        ni->ni_rsncipher, ni->ni_pmk, ni->ni_macaddr, ic->ic_myaddr,
+        ni->ni_nonce, ic->ic_nonce, &tptk) != 0)
+        return;
     
     /* We are now expecting a new pairwise key. */
     ni->ni_flags |= IEEE80211_NODE_RSN_NEW_PTK;
@@ -339,8 +336,10 @@ ieee80211_recv_4way_msg2(struct ieee80211com *ic,
     /* NB: replay counter has already been verified by caller */
     
     /* PTK = CalcPTK(ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ic->ic_myaddr,
-                         ni->ni_macaddr, ni->ni_nonce, key->nonce, &tptk);
+    if (ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms,
+        ni->ni_rsncipher, ni->ni_pmk, ic->ic_myaddr, ni->ni_macaddr,
+        ni->ni_nonce, key->nonce, &tptk) != 0)
+        return;
     
     /* check Key MIC field using KCK */
     if (ieee80211_eapol_key_check_mic(key, tptk.kck) != 0) {
@@ -437,8 +436,10 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         return;
     }
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
-                         ic->ic_myaddr, key->nonce, ic->ic_nonce, &tptk);
+    if (ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms,
+        ni->ni_rsncipher, ni->ni_pmk, ni->ni_macaddr, ic->ic_myaddr,
+        key->nonce, ic->ic_nonce, &tptk) != 0)
+        return;
     
     info = BE_READ_2(key->info);
     
@@ -457,6 +458,8 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         DPRINTF(("decryption failed\n"));
         return;
     }
+    if (!ieee80211_eapol_key_data_valid(key))
+        return;
     
     /* parse key data field */
     frm = (const u_int8_t *)&key[1];
@@ -519,9 +522,16 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         return;
     }
     /* GTK KDE must be included if IGTK KDE is present */
-    if (igtk != NULL && gtk == NULL) {
-        DPRINTF(("IGTK KDE found but GTK KDE missing\n"));
+    if (igtk != NULL && (gtk == NULL || !(info & EAPOL_KEY_ENCRYPTED))) {
+        DPRINTF(("IGTK KDE requires encrypted GTK KDE\n"));
         return;
+    }
+    /* PMF cannot open the controlled port without an authenticated IGTK.
+     * Validate before acknowledging message 3 or installing any keys. */
+    if ((ni->ni_flags & IEEE80211_NODE_MFP) &&
+        !ieee80211_igtk_kde_valid(ni->ni_rsngroupmgmtcipher, igtk)) {
+        reason = IEEE80211_REASON_AUTH_LEAVE;
+        goto deauth;
     }
     /* check that the Install bit is set if using pairwise keys */
     if (ni->ni_rsncipher != IEEE80211_CIPHER_USEGROUP &&
@@ -551,14 +561,38 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             if (rsn.rsn_akms != ni->ni_rsnakms ||
                 rsn.rsn_groupcipher != ni->ni_rsngroupcipher ||
                 rsn.rsn_nciphers != 1 ||
-                !(rsn.rsn_ciphers & ic->ic_rsnciphers)) {
+                !(rsn.rsn_ciphers & ic->ic_rsnciphers) ||
+                (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms) &&
+                 rsn.rsn_ciphers != ni->ni_rsncipher)) {
                 reason = IEEE80211_REASON_BAD_PAIRWISE_CIPHER;
                 goto deauth;
             }
             /* use pairwise cipher suite of second RSN IE */
             ni->ni_rsnciphers = rsn.rsn_ciphers;
             ni->ni_rsncipher = (enum ieee80211_cipher)ni->ni_rsnciphers;
+            /* SHA1 PRF prefixes are independent of output length. A cipher
+             * change can still require more temporal-key bytes. SHA256
+             * changes are rejected above because they change KCK/KEK too. */
+            if (ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms,
+                ni->ni_rsncipher, ni->ni_pmk, ni->ni_macaddr, ic->ic_myaddr,
+                key->nonce, ic->ic_nonce, &tptk) != 0) {
+                reason = IEEE80211_REASON_BAD_PAIRWISE_CIPHER;
+                goto deauth;
+            }
+            memcpy(&ni->ni_ptk, &tptk, sizeof(tptk));
+        } else {
+            reason = IEEE80211_REASON_BAD_PAIRWISE_CIPHER;
+            goto deauth;
         }
+    }
+
+    /* Validate all lengths before message 4 acknowledges key installation. */
+    if ((gtk != NULL && gtk[1] !=
+         6 + ieee80211_cipher_keylen(ni->ni_rsngroupcipher)) ||
+        (ni->ni_rsncipher != IEEE80211_CIPHER_USEGROUP &&
+         BE_READ_2(key->keylen) != ieee80211_cipher_keylen(ni->ni_rsncipher))) {
+        reason = IEEE80211_REASON_AUTH_LEAVE;
+        goto deauth;
     }
     
     /* update the last seen value of the key replay counter field */
@@ -599,6 +633,8 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         
         /* map PTK to 802.11 key */
         k = &ni->ni_pairwise_key;
+        if (k->k_priv != NULL)
+            ieee80211_delete_key(ic, ni, k);
         memset(k, 0, sizeof(*k));
         k->k_cipher = ni->ni_rsncipher;
         k->k_rsc[0] = prsc;
@@ -635,6 +671,8 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         kid = gtk[6] & 3;
         k = &ic->ic_nw_keys[kid];
         if (ieee80211_must_update_group_key(k, &gtk[8], keylen)) {
+            if (k->k_priv != NULL)
+                ieee80211_delete_key(ic, ni, k);
             memset(k, 0, sizeof(*k));
             k->k_id = kid;    /* 0-3 */
             k->k_cipher = ni->ni_rsngroupcipher;
@@ -676,6 +714,8 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         /* map IGTK to 802.11 key */
         k = &ic->ic_nw_keys[kid];
         if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
+            if (k->k_priv != NULL)
+                ieee80211_delete_key(ic, ni, k);
             memset(k, 0, sizeof(*k));
             k->k_id = kid;    /* either 4 or 5 */
             k->k_cipher = ni->ni_rsngroupmgmtcipher;
@@ -696,6 +736,13 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             }
         }
     }
+    if (igtk != NULL)
+        ic->ic_igtk_kid = LE_READ_2(&igtk[6]);
+    if ((ni->ni_flags & IEEE80211_NODE_MFP) &&
+        !ieee80211_has_igtk(ic)) {
+        reason = IEEE80211_REASON_AUTH_LEAVE;
+        goto deauth;
+    }
     if (info & EAPOL_KEY_INSTALL)
         ni->ni_flags |= IEEE80211_NODE_TXRXPROT;
     
@@ -706,7 +753,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             ++ni->ni_key_count == 2)
 #endif
         {
-            if (deferlink == 0) {
+            if (deferlink == 0 && ieee80211_keys_ready(ic, ni)) {
                 DPRINTF(("marking port %s valid\n",
                          ether_sprintf(ni->ni_macaddr)));
                 ni->ni_port_valid = 1;
@@ -719,6 +766,8 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     }
 deauth:
     if (reason != 0) {
+        ni->ni_port_valid = 0;
+        ieee80211_set_link_state(ic, LINK_STATE_DOWN);
         IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
                             reason);
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
@@ -762,6 +811,8 @@ ieee80211_recv_4way_msg4(struct ieee80211com *ic,
         
         /* map PTK to 802.11 key */
         k = &ni->ni_pairwise_key;
+        if (k->k_priv != NULL)
+            ieee80211_delete_key(ic, ni, k);
         memset(k, 0, sizeof(*k));
         k->k_cipher = ni->ni_rsncipher;
         k->k_len = ieee80211_cipher_keylen(k->k_cipher);
@@ -859,7 +910,7 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
     const u_int8_t *frm, *efrm;
     const u_int8_t *gtk, *igtk;
     u_int16_t info, kid, reason = 0;
-    int keylen;
+    int keylen, deferlink = 0;
     
 #ifndef IEEE80211_STA_ONLY
     if (ic->ic_opmode != IEEE80211_M_STA &&
@@ -890,6 +941,8 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         DPRINTF(("decryption failed\n"));
         return;
     }
+    if (!ieee80211_eapol_key_data_valid(key))
+        return;
     
     /* parse key data field (shall contain a GTK KDE) */
     frm = (const u_int8_t *)&key[1];
@@ -928,11 +981,18 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
     keylen = ieee80211_cipher_keylen(ni->ni_rsngroupcipher);
     if (gtk[1] != 6 + keylen)
         return;
+
+    /* Reject malformed IGTK before changing the GTK during a rekey. */
+    if (igtk != NULL &&
+        !ieee80211_igtk_kde_valid(ni->ni_rsngroupmgmtcipher, igtk))
+        return;
     
     /* map GTK to 802.11 key */
     kid = gtk[6] & 3;
     k = &ic->ic_nw_keys[kid];
     if (ieee80211_must_update_group_key(k, &gtk[8], keylen)) {
+        if (k->k_priv != NULL)
+            ieee80211_delete_key(ic, ni, k);
         memset(k, 0, sizeof(*k));
         k->k_id = kid;    /* 0-3 */
         k->k_cipher = ni->ni_rsngroupcipher;
@@ -945,7 +1005,9 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         /* install the GTK */
         switch ((*ic->ic_set_key)(ic, ni, k)) {
             case 0:
+                break;
             case EBUSY:
+                deferlink = 1;
                 break;
             default:
                 reason = IEEE80211_REASON_AUTH_LEAVE;
@@ -967,6 +1029,8 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         /* map IGTK to 802.11 key */
         k = &ic->ic_nw_keys[kid];
         if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
+            if (k->k_priv != NULL)
+                ieee80211_delete_key(ic, ni, k);
             memset(k, 0, sizeof(*k));
             k->k_id = kid;    /* either 4 or 5 */
             k->k_cipher = ni->ni_rsngroupmgmtcipher;
@@ -977,13 +1041,22 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
             /* install the IGTK */
             switch ((*ic->ic_set_key)(ic, ni, k)) {
                 case 0:
+                    break;
                 case EBUSY:
+                    deferlink = 1;
                     break;
                 default:
                     reason = IEEE80211_REASON_AUTH_LEAVE;
                     goto deauth;
             }
         }
+    }
+    if (igtk != NULL)
+        ic->ic_igtk_kid = LE_READ_2(&igtk[6]);
+    if ((ni->ni_flags & IEEE80211_NODE_MFP) &&
+        !ieee80211_has_igtk(ic)) {
+        reason = IEEE80211_REASON_AUTH_LEAVE;
+        goto deauth;
     }
     if (info & EAPOL_KEY_SECURE) {
 #ifndef IEEE80211_STA_ONLY
@@ -993,8 +1066,10 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         {
             DPRINTF(("marking port %s valid\n",
                      ether_sprintf(ni->ni_macaddr)));
-            ni->ni_port_valid = 1;
-            ieee80211_set_link_state(ic, LINK_STATE_UP);
+            if (deferlink == 0 && ieee80211_keys_ready(ic, ni)) {
+                ni->ni_port_valid = 1;
+                ieee80211_set_link_state(ic, LINK_STATE_UP);
+            }
             ni->ni_assoc_fail = 0;
         }
     }
@@ -1010,6 +1085,8 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
     (void)ieee80211_send_group_msg2(ic, ni, NULL);
     return;
 deauth:
+    ni->ni_port_valid = 0;
+    ieee80211_set_link_state(ic, LINK_STATE_DOWN);
     IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH, reason);
     ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 }
@@ -1074,6 +1151,8 @@ ieee80211_recv_wpa_group_msg1(struct ieee80211com *ic,
     k = &ic->ic_nw_keys[kid];
     gtk = (const uint8_t *)&key[1]; /* key data field contains the GTK */
     if (ieee80211_must_update_group_key(k, gtk, keylen)) {
+        if (k->k_priv != NULL)
+            ieee80211_delete_key(ic, ni, k);
         memset(k, 0, sizeof(*k));
         k->k_id = kid;    /* 0-3 */
         k->k_cipher = ni->ni_rsngroupcipher;

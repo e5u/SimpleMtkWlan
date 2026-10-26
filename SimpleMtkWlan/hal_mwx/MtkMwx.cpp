@@ -491,7 +491,9 @@ struct mwx_node {
 	uint16_t		flags;
 };
 #define	MWX_NODE_FLAG_HAVE_PAIRWISE_KEY		0x1
-#define	MWX_NODE_FLAG_HAVE_GROUP_KEY		0x2
+#define	MWX_NODE_FLAG_HAVE_GROUP_KEY		0x1e /* GTK ids 0..3 */
+#define	MWX_NODE_FLAG_HAVE_IGTK			0x60 /* IGTK ids 4..5 */
+#define	MWX_NODE_FLAG_KEY_FAILED			0x80
 
 struct mwx_vif {
 	struct mwx_node		vif_mn;
@@ -510,6 +512,7 @@ enum mwx_hw_type {
 struct mwx_setkey_task_arg {
 	struct ieee80211_node	*ni;
 	struct ieee80211_key	*k;
+	struct ieee80211_key	snapshot;
 };
 
 struct mwx_softc {
@@ -579,6 +582,7 @@ struct mwx_softc {
 	size_t			sc_bgscan_arg_size;
 
 	struct mwx_setkey_task_arg	sc_setkey_arg[8];
+	struct ieee80211_node	*sc_setkey_inflight;
 	int			sc_setkey_cur;
 	int			sc_setkey_tail;
 
@@ -1019,6 +1023,8 @@ int	mwx_set_key(struct ieee80211com *, struct ieee80211_node *,
 void	mwx_delete_key(struct ieee80211com *, struct ieee80211_node *,
 	    struct ieee80211_key *);
 void	mwx_setkey_task(void *);
+static void mwx_cancel_key_tasks(struct mwx_softc *, struct ieee80211_node *,
+    struct ieee80211_key *);
 
 int	mwx_tx(struct mwx_softc *, struct mbuf *, struct ieee80211_node *);
 void	mwx_rx(struct mwx_softc *, struct mbuf *, struct mbuf_list *, uint8_t);
@@ -1273,6 +1279,9 @@ mwx_init(struct ifnet *ifp)
 	struct ieee80211com *ic = &sc->sc_ic;
 	int rv;
 
+#ifdef AIRPORT_WCL
+	AirportWCL::beginMacRestartInit(ic->ic_wcl_mac_reconfig);
+#endif
 	if (ic->ic_event_handler)
 		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_RESET_BEGIN, NULL);
 	rv = mwx_init_hw(ifp);
@@ -1463,6 +1472,7 @@ mwx_stop_internal(struct ifnet *ifp, bool teardown_owner)
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
 	}
+	mwx_cancel_key_tasks(sc, NULL, NULL);
 	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
 
@@ -1549,6 +1559,7 @@ mwx_start(struct ifnet *ifp)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni;
 	struct ether_header *eh;
+	struct ieee80211_frame *wh;
 	struct mbuf *m;
 
 	if (!(ifp->if_flags & IFF_RUNNING) || ifq_is_oactive(&ifp->if_snd))
@@ -1595,6 +1606,28 @@ mwx_start(struct ifnet *ifp)
 		}
 
  sendit:
+		wh = mtod(m, struct ieee80211_frame *);
+		if (wh != NULL &&
+		    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT &&
+		    IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+		    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
+			/* Group management uses software BIP. Unicast management uses
+			 * the same hardware CCMP path as data, exactly once. */
+			struct ieee80211_key *k = ieee80211_get_txkey(ic, wh, ni);
+			if (k == NULL || k->k_cipher != IEEE80211_CIPHER_BIP ||
+			    (k->k_flags & IEEE80211_KEY_SWCRYPTO) == 0) {
+				m_freem(m);
+				ifp->if_oerrors++;
+				ieee80211_release_node(ic, ni);
+				continue;
+			}
+			m = ieee80211_encrypt(ic, m, k);
+			if (m == NULL) {
+				ifp->if_oerrors++;
+				ieee80211_release_node(ic, ni);
+				continue;
+			}
+		}
 #if NBPFILTER > 0
 		if (ic->ic_rawbpf != NULL)
 			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
@@ -1833,6 +1866,7 @@ mwx_newstate_task(void *ptr)
 		 */
 		if (nstate < IEEE80211_S_RUN &&
 		    ic->ic_opmode == IEEE80211_M_STA) {
+			mwx_cancel_key_tasks(sc, NULL, NULL);
 			int brv = mt7921_mcu_set_associated_bss(sc, 0);
 			int srv = mt7921_mac_sta_update(sc, ic->ic_bss, 0, 0);
 			MWX_DEV_LOG(sc, "leave BSS: bss_off=%d sta_remove=%d\n",
@@ -1864,6 +1898,8 @@ mwx_newstate_task(void *ptr)
 			break;
 		break;
 	case IEEE80211_S_AUTH:
+		if (ic->ic_bss != NULL)
+			((struct mwx_node *)ic->ic_bss)->flags = 0;
 		rv = mt7921_set_channel(sc);
 		if (rv)
 			break;
@@ -1954,10 +1990,15 @@ mwx_bgscan(struct ieee80211com *ic)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	uint64_t now_ns = 0;
+	bool wcl_targeted = false;
 	int err;
 
-	if (sc->sc_flags & MWX_FLAG_SCANNING)
-		return 0;
+	if (sc->sc_flags & MWX_FLAG_SCANNING) {
+		MWX_DEV_LOG(sc,
+		    "scan admission busy: hardware scan already active flags=0x%x state=%d\n",
+		    sc->sc_flags, ic->ic_state);
+		return EBUSY;
+	}
 
 	/*
 	 * While associated, a full hardware scan keeps the radio off the
@@ -1972,14 +2013,27 @@ mwx_bgscan(struct ieee80211com *ic)
 		/*
 		 * macOS asks for a few channels at a time (well under a second
 		 * off channel); only full sweeps get the 2 minute limit.
+		 * An SSID-directed request is part of an explicit UI join. It
+		 * must run immediately even when a broad cache scan just ran,
+		 * otherwise CoreWLAN reports that a visible network is absent
+		 * before WCL ever reaches association.
 		 */
+		wcl_targeted = ic->ic_wcl_scan_requested &&
+		    ic->ic_wcl_scan_ssid_length != 0;
 		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted)
 			min_ns = 10ULL * 1000000000ULL;
 #endif
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
-		if (sc->sc_last_bgscan_ns != 0 &&
-		    now_ns - sc->sc_last_bgscan_ns < min_ns)
+		if (!wcl_targeted && sc->sc_last_bgscan_ns != 0 &&
+		    now_ns - sc->sc_last_bgscan_ns < min_ns) {
+			MWX_DEV_LOG(sc,
+			    "scan admission throttled: elapsed_ms=%llu min_ms=%llu targeted=%d restricted=%d\n",
+			    (unsigned long long)((now_ns - sc->sc_last_bgscan_ns) /
+			    1000000ULL),
+			    (unsigned long long)(min_ns / 1000000ULL), wcl_targeted,
+			    ic->ic_wcl_scan_restricted);
 			return EBUSY;
+		}
 	}
 
 	err = mt7921_mcu_hw_scan(sc, 1);
@@ -2092,12 +2146,91 @@ mwx_bgscan_done_task(void *arg)
 	splx(s);
 }
 
+static void
+mwx_cancel_key_tasks(struct mwx_softc *sc, struct ieee80211_node *ni,
+    struct ieee80211_key *key)
+{
+	for (unsigned i = sc->sc_setkey_tail; i != sc->sc_setkey_cur;
+	    i = (i + 1) % nitems(sc->sc_setkey_arg)) {
+		struct mwx_setkey_task_arg *a = &sc->sc_setkey_arg[i];
+		if (a->ni == NULL || (ni != NULL && ni != a->ni) ||
+		    (key != NULL && key != a->k))
+			continue;
+		struct ieee80211_node *pending = a->ni;
+		a->ni = NULL;
+		a->k = NULL;
+		explicit_bzero(&a->snapshot, sizeof(a->snapshot));
+		ieee80211_release_node(&sc->sc_ic, pending);
+	}
+	while (sc->sc_setkey_tail != sc->sc_setkey_cur &&
+	    sc->sc_setkey_arg[sc->sc_setkey_tail].ni == NULL)
+		sc->sc_setkey_tail = (sc->sc_setkey_tail + 1) % nitems(sc->sc_setkey_arg);
+}
+
+static int
+mwx_keys_ready(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	if (ni == NULL || sc->sc_setkey_inflight == ni)
+		return 0;
+	for (unsigned i = sc->sc_setkey_tail; i != sc->sc_setkey_cur;
+	    i = (i + 1) % nitems(sc->sc_setkey_arg)) {
+		if (sc->sc_setkey_arg[i].ni == ni)
+			return 0;
+	}
+	struct mwx_node *mn = (struct mwx_node *)ni;
+	bool ready = (mn->flags & MWX_NODE_FLAG_HAVE_PAIRWISE_KEY) &&
+	    (mn->flags & MWX_NODE_FLAG_HAVE_GROUP_KEY) &&
+	    (!(ni->ni_flags & IEEE80211_NODE_MFP) ||
+	    (ieee80211_has_igtk(&sc->sc_ic) &&
+	    (mn->flags & (1U << (sc->sc_ic.ic_igtk_kid + 1))))) &&
+	    !(mn->flags & MWX_NODE_FLAG_KEY_FAILED);
+	if (sc->sc_ic.ic_bss != ni || sc->sc_ic.ic_state != IEEE80211_S_RUN ||
+	    sc->sc_ns_state != IEEE80211_S_RUN)
+		ready = false;
+	return ready;
+}
+
+static void
+mwx_key_update_port(struct mwx_softc *sc, struct ieee80211_node *ni)
+{
+	bool ready = mwx_keys_ready(&sc->sc_ic, ni);
+	if (!ready) {
+		ni->ni_port_valid = 0;
+		ni->ni_flags &= ~(IEEE80211_NODE_TXMGMTPROT | IEEE80211_NODE_RXMGMTPROT);
+		if (sc->sc_ic.ic_bss == ni)
+			ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_DOWN);
+		return;
+	}
+	if (ni->ni_flags & IEEE80211_NODE_MFP)
+		ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT | IEEE80211_NODE_RXMGMTPROT;
+	if (!ni->ni_port_valid)
+		MWX_DEV_LOG(sc, "key add complete port valid pmf=%u node_flags=0x%x\n",
+		    !!(ni->ni_flags & IEEE80211_NODE_MFP), ((struct mwx_node *)ni)->flags);
+	ni->ni_port_valid = 1;
+	ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_UP);
+}
+
 int
 mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	struct mwx_setkey_task_arg *a;
+	if (ni == NULL)
+		ni = ic->ic_bss;
+	if (ni == NULL)
+		return ENXIO;
+	mwx_cancel_key_tasks(sc, ni, k);
+	if ((k->k_flags & IEEE80211_KEY_IGTK) &&
+	    (k->k_cipher != IEEE80211_CIPHER_BIP || k->k_len != 16 ||
+	    (k->k_id != 4 && k->k_id != 5)))
+		return EINVAL;
+	if ((k->k_flags & IEEE80211_KEY_GROUP) && k->k_id > 3)
+		return EINVAL;
+	if ((sc->sc_setkey_cur + 1) % nitems(sc->sc_setkey_arg) ==
+	    sc->sc_setkey_tail)
+		return ENOSPC;
 
 	DPRINTF("%s: set_key: ni %p, k_id %d, k_flags %x k_cipher %d\n",
 	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
@@ -2119,15 +2252,14 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 		MWX_DEV_LOG(sc, "%s key id=%d cipher=%d sw crypto setup=%d\n",
 		    (k->k_flags & IEEE80211_KEY_GROUP) ? "group" : "pairwise",
 		    k->k_id, k->k_cipher, err);
+		if (err != 0)
+			return err;
 	}
 
-	if ((sc->sc_setkey_cur + 1) % nitems(sc->sc_setkey_arg) ==
-	    sc->sc_setkey_tail)
-		return ENOSPC;
-
 	a = &sc->sc_setkey_arg[sc->sc_setkey_cur];
-	a->ni = ni;
+	a->ni = ieee80211_ref_node(ni);
 	a->k = k;
+	a->snapshot = *k;
 	sc->sc_setkey_cur = (sc->sc_setkey_cur + 1) % nitems(sc->sc_setkey_arg);
 	task_add(sc->sc_nswq, &sc->sc_setkey_task);
 	return EBUSY;
@@ -2138,6 +2270,9 @@ mwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	mwx_cancel_key_tasks(sc, ni, k);
+	if (k->k_cipher == IEEE80211_CIPHER_NONE)
+		return;
 
 	DPRINTF("%s: delete_key: ni %p, k_id %d, k_flags %x k_cipher %d\n",
 	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
@@ -2171,12 +2306,66 @@ mwx_setkey_task(void *arg)
 			return;
 		}
 		a = &sc->sc_setkey_arg[sc->sc_setkey_tail];
-		mt7921_mcu_sta_key_update(sc, a->ni, a->k);
+		struct ieee80211_node *ni = a->ni;
+		struct ieee80211_key *key = a->k;
+		struct ieee80211_key snapshot = a->snapshot;
 		a->ni = NULL;
 		a->k = NULL;
-
+		explicit_bzero(&a->snapshot, sizeof(a->snapshot));
 		sc->sc_setkey_tail = (sc->sc_setkey_tail + 1) %
 		    nitems(sc->sc_setkey_arg);
+		if (ni == NULL) {
+			explicit_bzero(&snapshot, sizeof(snapshot));
+			continue;
+		}
+		struct mwx_node *mn = (struct mwx_node *)ni;
+		if (ni != sc->sc_ic.ic_bss || sc->sc_ns_state != IEEE80211_S_RUN ||
+		    (mn->flags & MWX_NODE_FLAG_KEY_FAILED)) {
+			explicit_bzero(&snapshot, sizeof(snapshot));
+			ieee80211_release_node(&sc->sc_ic, ni);
+			continue;
+		}
+		/* MCU waits may release the work-loop gate. Do not mark a key ready
+		 * if a rekey/deletion replaced it while the firmware command ran. */
+		int rv = 0;
+		if (key->k_priv != snapshot.k_priv ||
+		    key->k_cipher != snapshot.k_cipher || key->k_len != snapshot.k_len ||
+		    key->k_id != snapshot.k_id ||
+		    memcmp(key->k_key, snapshot.k_key, sizeof(key->k_key)) != 0)
+			rv = ECANCELED;
+		else
+		{
+			sc->sc_setkey_inflight = ni;
+			rv = mt7921_mcu_sta_key_update(sc, ni, &snapshot);
+			sc->sc_setkey_inflight = NULL;
+		}
+		if (rv == 0 && (key->k_priv != snapshot.k_priv ||
+		    key->k_cipher != snapshot.k_cipher || key->k_len != snapshot.k_len ||
+		    key->k_id != snapshot.k_id ||
+		    memcmp(key->k_key, snapshot.k_key, sizeof(key->k_key)) != 0))
+			rv = ECANCELED;
+		if (rv == 0) {
+			if (snapshot.k_flags & IEEE80211_KEY_IGTK)
+				mn->flags |= 1U << (snapshot.k_id + 1);
+			else if (snapshot.k_flags & IEEE80211_KEY_GROUP)
+				mn->flags |= 1U << (snapshot.k_id + 1);
+			else
+				mn->flags |= MWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
+			mwx_key_update_port(sc, ni);
+		} else {
+			MWX_DEV_LOG(sc, "key install failed id=%u cipher=%u rv=%d\n",
+			    snapshot.k_id, snapshot.k_cipher, rv);
+			mn->flags |= MWX_NODE_FLAG_KEY_FAILED;
+			mwx_key_update_port(sc, ni);
+			mwx_cancel_key_tasks(sc, ni, NULL);
+			if (ni == sc->sc_ic.ic_bss && sc->sc_ns_state == IEEE80211_S_RUN) {
+				IEEE80211_SEND_MGMT(&sc->sc_ic, ni,
+				    IEEE80211_FC0_SUBTYPE_DEAUTH, IEEE80211_REASON_AUTH_LEAVE);
+				ieee80211_new_state(&sc->sc_ic, IEEE80211_S_SCAN, -1);
+			}
+		}
+		explicit_bzero(&snapshot, sizeof(snapshot));
+		ieee80211_release_node(&sc->sc_ic, ni);
 	}
 
 	splx(s);
@@ -3017,13 +3206,22 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    IEEE80211_C_SHPREAMBLE |	/* short preamble supported */
 	    IEEE80211_C_QOS |		/* WMM, required for 11n */
 	    IEEE80211_C_TX_AMPDU;	/* TX A-MPDU, BA set up in firmware */
+	/*
+	 * WCL scans SAE-only candidates before it submits the join request.
+	 * The PMF capability therefore has to exist during that scan, not only
+	 * after startWCLJoin() has classified the network as SAE.
+	 */
+	if (ic->ic_userflags & IEEE80211_F_WPA3) {
+		ic->ic_caps |= IEEE80211_C_MFP;
+		MWX_DEV_LOG(sc, "SAE enabled: scan-time MFP capability set\n");
+	}
 
 	{
 		int on = 0;
 		sc->sc_rx_amsdu_enabled = PE_parse_boot_argn("-mtkrxamsdu", &on, sizeof(on));
 		if (sc->sc_rx_amsdu_enabled)
 			ic->ic_caps |= IEEE80211_C_AMSDU_IN_AMPDU;
-		MWX_DEV_LOG(sc, "RX A-MSDU reassembly enabled=%d max_body=3839\n",
+		MWX_DEV_LOG(sc, "RX A-MSDU reassembly enabled=%d max_body=7935\n",
 		    sc->sc_rx_amsdu_enabled);
 	}
 
@@ -3049,7 +3247,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	 */
 	ic->ic_htcaps = IEEE80211_HTCAP_LDPC |
 	    IEEE80211_HTCAP_SGI20 | IEEE80211_HTCAP_SGI40 |
-	    IEEE80211_HTCAP_CBW20_40 |
+	    IEEE80211_HTCAP_CBW20_40 | IEEE80211_HTCAP_AMSDU7935 |
 	    (1U << IEEE80211_HTCAP_RXSTBC_SHIFT);	/* RX STBC, 1 stream */
 	ic->ic_htcaps |=
 	    (IEEE80211_HTCAP_SMPS_DIS << IEEE80211_HTCAP_SMPS_SHIFT);
@@ -3130,6 +3328,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	ic->ic_bgscan_start = mwx_bgscan;
 	ic->ic_bgscan_done = mwx_bgscan_done;
 	ic->ic_set_key = mwx_set_key;
+	ic->ic_keys_ready = mwx_keys_ready;
 	ic->ic_ampdu_rx_start = mwx_ampdu_rx_start;
 	ic->ic_ampdu_rx_stop = mwx_ampdu_rx_stop;
 	ic->ic_ampdu_tx_start = mwx_ampdu_tx_start;
@@ -6052,8 +6251,11 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct mt76_connac_hw_scan_done *event;
+	uint8_t event_seq = 0;
+	bool have_seq = false;
 	uint32_t probe_sum = 0, mdrdy_sum = 0;
 	int i, nodes_before;
+	int cancel_err;
 
 	sc->sc_scan_done_count++;
 	nodes_before = mwx_count_nodes(ic);
@@ -6061,6 +6263,8 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 
 	if (mbuf_len(m) >= sizeof(*event)) {
 		event = mtod(m, struct mt76_connac_hw_scan_done *);
+		event_seq = event->seq_num;
+		have_seq = true;
 		for (i = 0; i < MT76_HW_SCAN_DONE_MAX_CHANNEL_NUM; i++) {
 			probe_sum += event->beacon_probe_num[i];
 			mdrdy_sum += event->mdrdy_count[i];
@@ -6080,8 +6284,29 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 		    sc->sc_rx_pkt_normal, sc->sc_rx_fill_fail);
 	}
 
-	if (mt7921_mcu_hw_scan_cancel(sc) != 0)
+	/*
+	 * A delayed completion for an older request must not cancel or clear
+	 * the scan that is currently on the radio.
+	 */
+	if (have_seq && event_seq != sc->sc_scan_seq_num) {
+		MWX_DEV_LOG(sc,
+		    "ignoring stale scan completion: event_seq=%u active_seq=%u flags=0x%x\n",
+		    event_seq, sc->sc_scan_seq_num, sc->sc_flags);
 		return;
+	}
+
+	/*
+	 * The completion proves that firmware no longer owns this scan. Treat
+	 * the cancel as best-effort and release both software flags even when
+	 * the extra cancel command fails, otherwise one failed MCU command
+	 * leaves every later scan blocked behind a permanently busy bit.
+	 */
+	cancel_err = mt7921_mcu_hw_scan_cancel(sc);
+	if (cancel_err != 0)
+		MWX_DEV_LOG(sc,
+		    "scan completion cancel cleanup failed err=%d; clearing local flags\n",
+		    cancel_err);
+	sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
 	task_add(systq, &sc->sc_scan_task);
 }
 
@@ -6856,6 +7081,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	uint8_t chfnum, remove_pad /*, qos_ctl = 0, amsdu_info */;
 	int idx, unicast, num_rxd = 6;
 	uint32_t ampdu_timestamp = 0;
+	const uint8_t *rx_pn = NULL;
 	int i;
 //	bool insert_ccmp_hdr = false;
 
@@ -6998,6 +7224,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		rxd += 4;
 	}
 	if (rxd1 & MT_RXD1_NORMAL_GROUP_1) {
+		rx_pn = (const uint8_t *)rxd;
 		num_rxd += 4;
 		rxd += 4;
 	}
@@ -7242,6 +7469,36 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		}
 		return -1;
 	}
+	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+		uint8_t *frame = mtod(m, uint8_t *) + hdr_gap;
+		if ((frame[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT) {
+			if (mbuf_len(m) < hdr_gap + sizeof(struct ieee80211_frame))
+				return -EINVAL;
+			struct ieee80211_frame *wh = (struct ieee80211_frame *)frame;
+			if (!IEEE80211_IS_MULTICAST(wh->i_addr1)) {
+				/* GROUP_1 carries PN0..PN5. Restore the stripped CCMP IV
+				 * in descriptor headroom for net80211's management PN check.
+				 * Never interpret a decrypted action body as an IV. */
+				unsigned hdrlen = ieee80211_get_hdrlen(wh);
+				uint8_t pn[6];
+				unsigned cipher = (rxd1 & MT_RXD1_NORMAL_SEC_MODE_MASK) >>
+				    MT_RXD1_NORMAL_SEC_MODE_SHIFT;
+				if (cipher != 4 || rx_pn == NULL ||
+				    mbuf_len(m) < hdr_gap + hdrlen)
+					return -EINVAL;
+				memcpy(pn, rx_pn, sizeof(pn));
+				memmove(frame - IEEE80211_CCMP_HDRLEN, frame, hdrlen);
+				frame -= IEEE80211_CCMP_HDRLEN;
+				uint8_t *iv = frame + hdrlen;
+				iv[0] = pn[0]; iv[1] = pn[1]; iv[2] = 0;
+				iv[3] = ((rxd1 & MT_RXD1_NORMAL_KEY_ID_MASK) >> 21 << 6) | 0x20;
+				for (unsigned j = 2; j < sizeof(pn); j++)
+					iv[j + 2] = pn[j];
+				frame[1] |= IEEE80211_FC1_PROTECTED;
+				hdr_gap -= IEEE80211_CCMP_HDRLEN;
+			}
+		}
+	}
 	m_adj(m, hdr_gap);
 #if 0
 	if (status->amsdu) {
@@ -7290,13 +7547,16 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
 		/*
 		 * MT7921/MT7922 firmware decrypts and removes CCMP IV/MIC.
-		 * Leave the protected bit clear so net80211 does not try to
-		 * strip an IV which is no longer present.
+		 * Data retains the established offload behavior. Unicast management
+		 * has a restored IV for net80211 PN validation; group management
+		 * retains its unmodified FC and MMIE for software BIP verification.
 		 */
 		struct ieee80211_frame *wh;
 
 		wh = mtod(m, struct ieee80211_frame *);
-		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
+		if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) !=
+		    IEEE80211_FC0_TYPE_MGT)
+			wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
 	}
 
 	return 0;
@@ -8168,8 +8428,6 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	struct mwx_vif *mvif = &sc->sc_vif;
 	struct mwx_node *mn = (struct mwx_node *)ni;
 	struct mbuf *m;
-	int want_keymask = (MWX_NODE_FLAG_HAVE_PAIRWISE_KEY |
-	    MWX_NODE_FLAG_HAVE_GROUP_KEY);
 	int rv;
 	uint16_t tlvnum = 0, wcid = 0;
 	uint8_t muar_idx = 0;
@@ -8181,6 +8439,14 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (ni == NULL)
 		return ENXIO;
 
+	if (k->k_flags & IEEE80211_KEY_IGTK) {
+		/* BIP is handled in software. A standalone connac2 BIP TLV would
+		 * replace the GTK; Linux sends a combined CCMP+BIP record instead.
+		 * Do not offload/strip the MMIE we need for independent verification. */
+		return k->k_cipher == IEEE80211_CIPHER_BIP && k->k_len == 16 &&
+		    (k->k_id == 4 || k->k_id == 5) &&
+		    (k->k_flags & IEEE80211_KEY_SWCRYPTO) && k->k_priv != NULL ? 0 : EINVAL;
+	}
 	if ((k->k_flags & IEEE80211_KEY_GROUP) != 0) {
 		wcid = mvif->vif_mn.wcid;
 		muar_idx = 0x0e;
@@ -8210,23 +8476,6 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	    "key add done id=%d flags=0x%x cipher=%d wcid=%u node_flags_before=0x%x\n",
 	    k->k_id, k->k_flags, k->k_cipher, wcid, mn->flags);
 
-	/* Keep track of added keys to trigger link up when all are done. */
-	if ((k->k_flags & IEEE80211_KEY_GROUP) != 0)
-		mn->flags |= MWX_NODE_FLAG_HAVE_GROUP_KEY;
-	else
-		mn->flags |= MWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
-
-	if ((mn->flags & want_keymask) == want_keymask) {
-		DPRINTF("marking port %s valid\n", ether_sprintf(ni->ni_macaddr));
-		MWX_DEV_LOG(sc,
-		    "key add complete port valid mac=%s node_flags=0x%x\n",
-		    ether_sprintf(ni->ni_macaddr), mn->flags);
-		if (ni->ni_flags & IEEE80211_NODE_MFP)
-			ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT;
-		ni->ni_port_valid = 1;
-		ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_UP);
-	}
-
 	return 0;
 }
 
@@ -8247,14 +8496,24 @@ mt7921_mcu_sta_key_delete(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (ni == NULL)
 		return;
 
+	if (k->k_flags & IEEE80211_KEY_IGTK) {
+		/* IGTK never occupies a firmware slot. In particular deleting an old
+		 * IGTK must not issue connac2's delete-all-ciphers request for GTK. */
+		if (k->k_id == 4 || k->k_id == 5)
+			mn->flags &= ~(1U << (k->k_id + 1));
+		mwx_key_update_port(sc, ni);
+		return;
+	}
 	if ((k->k_flags & IEEE80211_KEY_GROUP) != 0) {
 		wcid = mvif->vif_mn.wcid;
 		muar_idx = 0x0e;
+		/* The firmware delete command removes every cipher at this WCID. */
 		mn->flags &= ~MWX_NODE_FLAG_HAVE_GROUP_KEY;
 	} else {
 		wcid = mn->wcid;
 		mn->flags &= ~MWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
 	}
+	mwx_key_update_port(sc, ni);
 
 	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
 	if (m == NULL)
@@ -8730,7 +8989,7 @@ int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
             &tlvnum, STA_REC_HW_AMSDU, sizeof(*amsdu));
         amsdu->max_amsdu_num = 8;
         amsdu->amsdu_en = 1;
-        amsdu->max_mpdu_size = 0;	/* A-MSDUs up to 3839 bytes */
+        amsdu->max_mpdu_size = 1;	/* A-MSDUs up to 7935 bytes */
     }
     if (ni->ni_flags & IEEE80211_NODE_VHT) {
         struct sta_rec_vht_v1 *vht = (struct sta_rec_vht_v1 *)mwx_append_tlv(m,
@@ -9171,7 +9430,10 @@ MtkMwx::debugPoll()
 				    ether_sprintf(ic->ic_bss->ni_macaddr));
 				if (ic->ic_state == IEEE80211_S_AUTH)
 					IEEE80211_SEND_MGMT(ic, ic->ic_bss,
-					    IEEE80211_FC0_SUBTYPE_AUTH, 1);
+					    IEEE80211_FC0_SUBTYPE_AUTH,
+					    ic->ic_sae_confirm_ready ?
+					    IEEE80211_AUTH_SAE_CONFIRM :
+					    IEEE80211_AUTH_OPEN_REQUEST);
 				else
 					IEEE80211_SEND_MGMT(ic, ic->ic_bss,
 					    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);

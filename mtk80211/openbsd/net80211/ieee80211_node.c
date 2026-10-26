@@ -81,7 +81,9 @@ struct ieee80211_node *ieee80211_node_alloc(struct ieee80211com *);
 void ieee80211_node_free(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_node_copy(struct ieee80211com *, struct ieee80211_node *,
                          const struct ieee80211_node *);
-void ieee80211_choose_rsnparams(struct ieee80211com *);
+int ieee80211_choose_rsnparams(struct ieee80211com *);
+static u_int32_t ieee80211_eligible_akms(struct ieee80211com *,
+    struct ieee80211_node *);
 u_int8_t ieee80211_node_getrssi(struct ieee80211com *,
                                 const struct ieee80211_node *);
 int ieee80211_node_checkrssi(struct ieee80211com *,
@@ -314,6 +316,9 @@ ieee80211_ess_setwpaparms(struct ieee80211_ess *ess,
         ess->rsnakms |= IEEE80211_AKM_8021X;
     if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_8021X)
         ess->rsnakms |= IEEE80211_AKM_SHA256_8021X;
+    /* The front end filters SAE before saving automatic-join parameters. */
+    if (wpa->i_akms & IEEE80211_WPA_AKM_SAE)
+        ess->rsnakms |= IEEE80211_AKM_SAE;
     if (ess->rsnakms == 0)	/* set to default (PSK) */
         ess->rsnakms = IEEE80211_AKM_PSK;
     
@@ -599,7 +604,10 @@ ieee80211_match_ess(struct ieee80211_ess *ess, struct ieee80211_node *ni)
 void
 ieee80211_switch_ess(struct ieee80211com *ic)
 {
-    XYLog("%s\n", __FUNCTION__);
+    XYLog("%s desired_len=%u desired=%.*s bssid=%s auto=%u\n", __FUNCTION__,
+          ic->ic_des_esslen, ic->ic_des_esslen, ic->ic_des_essid,
+          ether_sprintf(ic->ic_des_bssid),
+          !!(ic->ic_flags & IEEE80211_F_AUTO_JOIN));
     struct _ifnet		*ifp = &ic->ic_if;
     struct ieee80211_ess	*ess, *seless = NULL;
     struct ieee80211_node	*ni, *selni = NULL;
@@ -625,6 +633,8 @@ ieee80211_switch_ess(struct ieee80211com *ic)
          * We might have a password stored for this network.
          */
         if (!ISSET(ic->ic_flags, IEEE80211_F_AUTO_JOIN)) {
+            if (ic->ic_wcl_join_requested)
+                return;
             if (ic->ic_des_esslen == ni->ni_esslen &&
                 memcmp(ic->ic_des_essid, ni->ni_essid,
                        ni->ni_esslen) == 0 &&
@@ -673,6 +683,10 @@ void
 ieee80211_set_ess(struct ieee80211com *ic, struct ieee80211_ess *ess, 
                   struct ieee80211_node *ni)
 {
+    XYLog("%s node_ssid_len=%u node_ssid=%.*s node_bssid=%s auto=%u\n",
+          __FUNCTION__, ni->ni_esslen, ni->ni_esslen, ni->ni_essid,
+          ether_sprintf(ni->ni_bssid),
+          !!(ic->ic_flags & IEEE80211_F_AUTO_JOIN));
     memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
     ic->ic_des_esslen = ni->ni_esslen;
     memcpy(ic->ic_des_essid, ni->ni_essid, ic->ic_des_esslen);
@@ -1120,14 +1134,8 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
          */
         if ((ni->ni_rsnprotos & ic->ic_rsnprotos) == 0)
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        if ((ni->ni_rsnakms & ic->ic_rsnakms) == 0)
+        if (ieee80211_eligible_akms(ic, ni) == 0)
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        if ((ni->ni_rsnakms & ic->ic_rsnakms &
-             ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) == 0) {
-            /* AP only supports PSK AKMPs */
-            if (!(ic->ic_flags & IEEE80211_F_PSK))
-                fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-        }
         if (ni->ni_rsngroupcipher != IEEE80211_CIPHER_WEP40 &&
             ni->ni_rsngroupcipher != IEEE80211_CIPHER_TKIP &&
             ni->ni_rsngroupcipher != IEEE80211_CIPHER_CCMP &&
@@ -1151,6 +1159,15 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
             (ic->ic_flags & IEEE80211_F_MFPR) &&
             !(ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC))
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
+    }
+
+    if (ic->ic_des_esslen != 0) {
+        XYLog("%s desired=%.*s/%s node=%.*s/%s fail=0x%x eligible_akms=0x%x node_akms=0x%x caps=0x%x\n",
+              __FUNCTION__, ic->ic_des_esslen, ic->ic_des_essid,
+              ether_sprintf(ic->ic_des_bssid), ni->ni_esslen, ni->ni_essid,
+              ether_sprintf(ni->ni_bssid), fail,
+              ieee80211_eligible_akms(ic, ni), ni->ni_rsnakms,
+              ni->ni_rsncaps);
     }
     
     if (ic->ic_if.if_flags & IFF_DEBUG && ieee80211_debug) {
@@ -1283,9 +1300,13 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
                            IEEE80211_F_DOSORT | IEEE80211_F_DOFRATE |
                            IEEE80211_F_DONEGO | IEEE80211_F_DODEL);
     
-    if (ic->ic_flags & IEEE80211_F_RSNON)
-        ieee80211_choose_rsnparams(ic);
-    else if (ic->ic_flags & IEEE80211_F_WEPON)
+    if (ic->ic_flags & IEEE80211_F_RSNON) {
+        if (ieee80211_choose_rsnparams(ic) != 0) {
+            ni->ni_assoc_fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
+            ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+            return;
+        }
+    } else if (ic->ic_flags & IEEE80211_F_WEPON)
         ni->ni_rsncipher = IEEE80211_CIPHER_USEGROUP;
     
     ieee80211_node_newstate(selbs, IEEE80211_STA_BSS);
@@ -1343,7 +1364,9 @@ struct ieee80211_node *
 ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
                           struct ieee80211_node **curbs)
 {
-    XYLog("%s\n", __FUNCTION__);
+    XYLog("%s desired_len=%u desired=%.*s bssid=%s\n", __FUNCTION__,
+          ic->ic_des_esslen, ic->ic_des_esslen, ic->ic_des_essid,
+          ether_sprintf(ic->ic_des_bssid));
     struct ieee80211_node *ni, *nextbs, *selbs = NULL,
     *selbs2 = NULL, *selbs5 = NULL;
     uint8_t min_5ghz_rssi;
@@ -1415,6 +1438,13 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     else if (selbs5)
         selbs = selbs5;
     
+    if (selbs)
+        XYLog("%s selected ssid_len=%u ssid=%.*s bssid=%s rssi=%d\n",
+              __FUNCTION__, selbs->ni_esslen, selbs->ni_esslen,
+              selbs->ni_essid, ether_sprintf(selbs->ni_bssid),
+              selbs->ni_rssi);
+    else
+        XYLog("%s no selected BSS\n", __FUNCTION__);
     return selbs;
 }
 
@@ -1622,7 +1652,37 @@ ieee80211_end_scan(struct _ifnet *ifp)
  * Autoselect the best RSN parameters (protocol, AKMP, pairwise cipher...)
  * that are supported by both peers (STA mode only).
  */
-void
+static u_int32_t
+ieee80211_eligible_akms(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    u_int32_t akms = ni->ni_rsnakms & ic->ic_rsnakms;
+
+    if (((ic->ic_flags & IEEE80211_F_MFPR) ||
+        (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPR)) &&
+        (!(ic->ic_caps & IEEE80211_C_MFP) ||
+        !(ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC) ||
+        ni->ni_rsngroupmgmtcipher != IEEE80211_CIPHER_BIP))
+        return 0;
+    if (!(ic->ic_flags & IEEE80211_F_PSK))
+        akms &= ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK);
+    /*
+     * Scan matching has to expose SAE-only BSSes before the user has supplied
+     * a password. Keep credential checks in ieee80211_choose_rsnparams() so
+     * the front end can show the network without allowing a credential-less
+     * association attempt.
+     */
+    if (!(ic->ic_userflags & IEEE80211_F_WPA3) ||
+        !(ic->ic_caps & IEEE80211_C_MFP) ||
+        !(ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC) ||
+        !(ni->ni_rsnprotos & ic->ic_rsnprotos & IEEE80211_PROTO_RSN) ||
+        !(ni->ni_rsnciphers & ic->ic_rsnciphers & IEEE80211_CIPHER_CCMP) ||
+        ni->ni_rsngroupcipher != IEEE80211_CIPHER_CCMP ||
+        ni->ni_rsngroupmgmtcipher != IEEE80211_CIPHER_BIP)
+        akms &= ~IEEE80211_AKM_SAE;
+    return akms;
+}
+
+int
 ieee80211_choose_rsnparams(struct ieee80211com *ic)
 {
     struct ieee80211_node *ni = ic->ic_bss;
@@ -1633,11 +1693,22 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
     /* prefer RSN (aka WPA2) over WPA */
     if (ni->ni_rsnprotos & IEEE80211_PROTO_RSN)
         ni->ni_rsnprotos = IEEE80211_PROTO_RSN;
-    else
+    else if (ni->ni_rsnprotos & IEEE80211_PROTO_WPA)
         ni->ni_rsnprotos = IEEE80211_PROTO_WPA;
+    else
+        return EINVAL;
     
     /* filter out unsupported AKMPs */
-    ni->ni_rsnakms &= ic->ic_rsnakms;
+    ni->ni_flags &= ~(IEEE80211_NODE_MFP | IEEE80211_NODE_PMKID);
+    ni->ni_rsnakms = ieee80211_eligible_akms(ic, ni);
+    if (!ic->ic_sae_password_len)
+        ni->ni_rsnakms &= ~IEEE80211_AKM_SAE;
+    if (ni->ni_rsnakms & IEEE80211_AKM_SAE) {
+        ni->ni_rsnakms = IEEE80211_AKM_SAE;
+        ni->ni_flags |= IEEE80211_NODE_MFP;
+    } else if (ni->ni_rsnakms == 0)
+        return EINVAL;
+    else
     /* prefer SHA-256 based AKMPs */
     if ((ic->ic_flags & IEEE80211_F_PSK) && (ni->ni_rsnakms &
                                              (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK))) {
@@ -1646,7 +1717,8 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
             ni->ni_rsnakms = IEEE80211_AKM_SHA256_PSK;
         else
             ni->ni_rsnakms = IEEE80211_AKM_PSK;
-    } else {
+    } else if (ni->ni_rsnakms &
+        (IEEE80211_AKM_8021X | IEEE80211_AKM_SHA256_8021X)) {
         if (ni->ni_rsnakms & IEEE80211_AKM_SHA256_8021X)
             ni->ni_rsnakms = IEEE80211_AKM_SHA256_8021X;
         else
@@ -1658,21 +1730,25 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
                    IEEE80211_PMKID_LEN);
             ni->ni_flags |= IEEE80211_NODE_PMKID;
         }
-    }
+    } else
+        return EINVAL;
     
     /* filter out unsupported pairwise ciphers */
     ni->ni_rsnciphers &= ic->ic_rsnciphers;
     /* prefer CCMP over TKIP */
     if (ni->ni_rsnciphers & IEEE80211_CIPHER_CCMP)
         ni->ni_rsnciphers = IEEE80211_CIPHER_CCMP;
-    else
+    else if (ni->ni_rsnciphers & IEEE80211_CIPHER_TKIP)
         ni->ni_rsnciphers = IEEE80211_CIPHER_TKIP;
+    else
+        return EINVAL;
     ni->ni_rsncipher = (enum ieee80211_cipher)ni->ni_rsnciphers;
     
     /* use MFP if we both support it */
     if ((ic->ic_caps & IEEE80211_C_MFP) &&
         (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC))
         ni->ni_flags |= IEEE80211_NODE_MFP;
+    return 0;
 }
 
 int

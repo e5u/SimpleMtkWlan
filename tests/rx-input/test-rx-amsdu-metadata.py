@@ -97,7 +97,8 @@ int main(){
  for(size_t n:{0u,25u,47u,3866u}){m=packet(std::vector<uint8_t>(n));assert(!mtkRxAmsduRestoreCcmp(m,good)&&live==0);}
  auto open=good;open.cipher=0;open.hwdec=false;open.protected_frame=false;open.pn_valid=false;m=packet(f);assert(mtkRxAmsduRestoreCcmp(m,open)==m);mbuf_freem(m);m=packet(frame(true));assert(!mtkRxAmsduRestoreCcmp(m,open)&&live==0);
  // Maximum supported complete body plus 8-byte IV remains bounded.
- f=frame(false);f.resize(26+3839,0x5a);m=packet(f);z=mtkRxAmsduRestoreCcmp(m,good);assert(z&&z->len==26+3839+8);mbuf_freem(z);
+ f=frame(false);f.resize(26+7935,0x5a);m=packet(f);z=mtkRxAmsduRestoreCcmp(m,good);assert(z&&z->len==26+7935+8);mbuf_freem(z);
+ f=frame(false);f.resize(26+7936,0x5a);m=packet(f);assert(!mtkRxAmsduRestoreCcmp(m,good)&&live==0);
  assert(live==0);puts("PASS: descriptor group/guard-page bounds, all formats/ciphers, PN order, padding, IV restoration, chained input, allocation/copy failures and exact ownership");
 }
 '''

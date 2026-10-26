@@ -135,7 +135,7 @@ mtkRxAmsduRestoreCcmp(mbuf_t m, const MtkRxDescriptorMeta &meta)
         return NULL;
     const size_t length = mbuf_pkthdr_len(m);
     if (meta.hdrlen != 26 || length < (size_t)meta.hdrlen + 14 + 8 ||
-        length > (size_t)meta.hdrlen + 3839 || mbuf_len(m) < meta.hdrlen) {
+        length > (size_t)meta.hdrlen + 7935 || mbuf_len(m) < meta.hdrlen) {
         mbuf_freem(m);
         return NULL;
     }

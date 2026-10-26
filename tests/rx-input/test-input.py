@@ -51,7 +51,7 @@ int main(){
 '''
 with tempfile.TemporaryDirectory() as d:
  p=Path(d);(p/'test.cpp').write_text(pre+dequeue+f+main)
- subprocess.run(['clang++','-std=c++14','-fsanitize=undefined','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+ subprocess.run(['clang++','-std=c++14','-fsanitize=' + __import__('os').environ.get('MTK_TEST_SANITIZERS', 'address,undefined'),'-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
  r=subprocess.run([str(p/'test')],capture_output=True,text=True)
  print(r.stdout+r.stderr)
  if '--expect-failure' in sys.argv:

@@ -63,6 +63,7 @@
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
+#include <net80211/ieee80211_crypto.h>
 
 int		ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
                                  struct ieee80211_node *ni, const struct ieee80211_ptk *ptk);
@@ -106,22 +107,15 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
     EAPOL_KEY_DESC_IEEE80211 : EAPOL_KEY_DESC_WPA;
     
     info = BE_READ_2(key->info);
-    /* use V3 descriptor if KDF is SHA256-based */
-    if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms))
-        info |= EAPOL_KEY_DESC_V3;
-    /* use V2 descriptor if pairwise or group cipher is CCMP */
-    else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
-             ni->ni_rsngroupcipher == IEEE80211_CIPHER_CCMP)
-        info |= EAPOL_KEY_DESC_V2;
-    else
-        info |= EAPOL_KEY_DESC_V1;
+    info &= ~EAPOL_KEY_VERSION_MASK;
+    info |= ieee80211_eapol_key_version((enum ieee80211_akm)ni->ni_rsnakms,
+        ni->ni_rsncipher, ni->ni_rsngroupcipher);
     BE_WRITE_2(key->info, info);
     
     len = mbuf_len(m) - sizeof(struct ether_header);
     BE_WRITE_2(key->paylen, len - sizeof(*key));
     BE_WRITE_2(key->len, len - 4);
     
-#ifndef IEEE80211_STA_ONLY
     if (info & EAPOL_KEY_ENCRYPTED) {
         if (ni->ni_rsnprotos == IEEE80211_PROTO_WPA) {
             /* clear "Encrypted" bit for WPA */
@@ -137,7 +131,6 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
             mbuf_setlen(m, l);
         }
     }
-#endif
     if (info & EAPOL_KEY_KEYMIC)
         ieee80211_eapol_key_mic(key, ptk->kck);
     

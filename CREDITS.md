@@ -37,6 +37,11 @@ files.
 - MT7921/RZ608 bring-up, 802.11n/ac, Tahoe build of AirportMtkWlan and
   integration with this hardware layer: flxxxxddd
   (https://github.com/flxxxxddd/SimpleMtkWlan).
+- SAE P-256 arithmetic uses Kenneth MacKay's micro-ecc
+  (https://github.com/kmackay/micro-ecc), with its BSD license retained in
+  `mtk80211/openbsd/net80211/sae/LICENSE-micro-ecc.txt`.
+- SAE and EAPOL protocol references and fixed test vectors follow hostap /
+  wpa_supplicant by Jouni Malinen and contributors (https://w1.fi/).
 
 ## Current Project Work
 

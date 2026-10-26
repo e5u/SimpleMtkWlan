@@ -682,11 +682,26 @@ enum {
 	IEEE80211_CATEG_MESH			= 13,
 	IEEE80211_CATEG_MULTIHOP		= 14,
 	IEEE80211_CATEG_SELF_PROT		= 15,
-	/* 16-125 reserved */
+	IEEE80211_CATEG_UNPROT_DMG		= 20,
+	IEEE80211_CATEG_VHT			= 21,
+	IEEE80211_CATEG_S1G			= 22,
 	IEEE80211_CATEG_PROT_VENDOR		= 126,
 	IEEE80211_CATEG_VENDOR			= 127
 	/* 128-255 error */
 };
+
+static __inline int
+ieee80211_is_robust_action(u_int8_t category)
+{
+	return category != IEEE80211_CATEG_PUB &&
+	    category != IEEE80211_CATEG_HT &&
+	    category != IEEE80211_CATEG_UNPROT_WNM &&
+	    category != IEEE80211_CATEG_SELF_PROT &&
+	    category != IEEE80211_CATEG_UNPROT_DMG &&
+	    category != IEEE80211_CATEG_VHT &&
+	    category != IEEE80211_CATEG_S1G &&
+	    category != IEEE80211_CATEG_VENDOR;
+}
 
 /*
  * Block Ack Action field values (see 802.11-2012 8.5.5 Table 8-202).
@@ -971,7 +986,11 @@ enum ieee80211_edca_ac {
  */
 #define IEEE80211_AUTH_ALG_OPEN			0x0000
 #define IEEE80211_AUTH_ALG_SHARED		0x0001
+#define IEEE80211_AUTH_ALG_SAE			0x0003
 #define IEEE80211_AUTH_ALG_LEAP			0x0080
+
+#define IEEE80211_AUTH_SAE_COMMIT		1
+#define IEEE80211_AUTH_SAE_CONFIRM		2
 
 /*
  * 802.11n HT Capability IE
@@ -1072,7 +1091,8 @@ enum {
 	IEEE80211_STATUS_BAD_AKMP		= 43,
 	IEEE80211_STATUS_RSN_IE_VER_UNSUP	= 44,
 
-	IEEE80211_STATUS_CIPHER_REJ_POLICY	= 46
+	IEEE80211_STATUS_CIPHER_REJ_POLICY	= 46,
+	IEEE80211_STATUS_SAE_ANTI_CLOGGING	= 76
 };
 
 #define	IEEE80211_WEP_KEYLEN			5	/* 40bit */
@@ -1207,6 +1227,7 @@ struct ieee80211_eapol_key {
 
 	u_int8_t	info[2];
 #define EAPOL_KEY_VERSION_MASK	0x7
+#define EAPOL_KEY_DESC_V0	0		/* AKM-defined (SAE: AES-CMAC) */
 #define EAPOL_KEY_DESC_V1	1
 #define EAPOL_KEY_DESC_V2	2
 #define EAPOL_KEY_DESC_V3	3		/* 11r */

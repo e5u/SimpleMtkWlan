@@ -230,11 +230,17 @@ ieee80211_mgmt_output(struct _ifnet *ifp, struct ieee80211_node *ni,
         IEEE80211_ADDR_COPY(wh->i_addr2, ic->ic_myaddr);
         IEEE80211_ADDR_COPY(wh->i_addr3, ni->ni_bssid);
 
-        /* check if protection is required for this mgmt frame */
+        /* Protect robust management only after its keys are installed. */
+        int robust = type == IEEE80211_FC0_SUBTYPE_DISASSOC ||
+            type == IEEE80211_FC0_SUBTYPE_DEAUTH;
+        if (type == IEEE80211_FC0_SUBTYPE_ACTION &&
+            mbuf_pkthdr_len(m) > sizeof(*wh)) {
+            u_int8_t category;
+            mbuf_copydata(m, sizeof(*wh), 1, &category);
+            robust = ieee80211_is_robust_action(category);
+        }
         if ((ic->ic_caps & IEEE80211_C_MFP) &&
-            (type == IEEE80211_FC0_SUBTYPE_DISASSOC ||
-             type == IEEE80211_FC0_SUBTYPE_DEAUTH ||
-             type == IEEE80211_FC0_SUBTYPE_ACTION)) {
+            (ni->ni_flags & IEEE80211_NODE_TXMGMTPROT) && robust) {
             /*
              * Hack: we should not set the Protected bit in outgoing
              * group management frames, however it is used as an
@@ -243,9 +249,7 @@ ieee80211_mgmt_output(struct _ifnet *ifp, struct ieee80211_node *ni,
              * management frames (software crypto code will do it).
              * XXX could use an mbuf flag..
              */
-            if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
-                (ni->ni_flags & IEEE80211_NODE_TXMGMTPROT))
-                wh->i_fc[1] |= IEEE80211_FC1_PROTECTED;
+            wh->i_fc[1] |= IEEE80211_FC1_PROTECTED;
         }
 
         if (ifp->if_flags & IFF_DEBUG) {
@@ -1078,6 +1082,11 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
         *frm++ = 6;
         count++;
     }
+    if (!wpa && (ni->ni_rsnakms & IEEE80211_AKM_SAE)) {
+        memcpy(frm, oui, 3); frm += 3;
+        *frm++ = 8;
+        count++;
+    }
     /* write AKM Suite List Count field */
     LE_WRITE_2(pcount, count);
 
@@ -1087,7 +1096,10 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
     /* write RSN Capabilities field */
     rsncaps = (ni->ni_rsncaps & (IEEE80211_RSNCAP_PTKSA_RCNT_MASK |
         IEEE80211_RSNCAP_GTKSA_RCNT_MASK));
-    if (ic->ic_caps & IEEE80211_C_MFP) {
+    /* MFPC and BIP are negotiated, not implied by local MFP support. */
+    bool mfp = (ic->ic_caps & IEEE80211_C_MFP) &&
+        (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC);
+    if (mfp) {
         rsncaps |= IEEE80211_RSNCAP_MFPC;
         if (ic->ic_flags & IEEE80211_F_MFPR)
             rsncaps |= IEEE80211_RSNCAP_MFPR;
@@ -1104,7 +1116,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
         frm += IEEE80211_PMKID_LEN;
     }
 
-    if (!(ic->ic_caps & IEEE80211_C_MFP))
+    if (!mfp)
         return frm;
 
     if ((ni->ni_flags & IEEE80211_NODE_PMKID) == 0) {
@@ -1480,18 +1492,42 @@ ieee80211_get_auth(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
 	mbuf_t m;
     u_int8_t *frm;
-    
-    mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m);
+    int sae = (ic->ic_userflags & IEEE80211_F_WPA3) &&
+        ni->ni_rsnakms == IEEE80211_AKM_SAE;
+    size_t body_len = 6;
+
+    if (sae) {
+        if (status != 0 || (seq != IEEE80211_AUTH_SAE_COMMIT &&
+            seq != IEEE80211_AUTH_SAE_CONFIRM) ||
+            (seq == IEEE80211_AUTH_SAE_CONFIRM && !ic->ic_sae.peer_ready))
+            return NULL;
+        body_len += seq == IEEE80211_AUTH_SAE_COMMIT ?
+            ieee80211_sae_commit_length(&ic->ic_sae) : IEEE80211_SAE_CONFIRM_LEN;
+    }
+    m = ieee80211_getmgmt(MBUF_DONTWAIT, MT_DATA, body_len);
     if (m == NULL)
         return NULL;
-    mbuf_align_32(m, 2 * 3);
-    mbuf_pkthdr_setlen(m, 2 * 3);
-    mbuf_setlen(m, 2 * 3);
+    mbuf_pkthdr_setlen(m, body_len);
+    mbuf_setlen(m, body_len);
     
     frm = mtod(m, u_int8_t *);
-    LE_WRITE_2(frm, IEEE80211_AUTH_ALG_OPEN); frm += 2;
+    LE_WRITE_2(frm, sae ? IEEE80211_AUTH_ALG_SAE : IEEE80211_AUTH_ALG_OPEN);
+    frm += 2;
     LE_WRITE_2(frm, seq); frm += 2;
-    LE_WRITE_2(frm, status);
+    LE_WRITE_2(frm, status); frm += 2;
+    if (sae && (seq == IEEE80211_AUTH_SAE_COMMIT ?
+        ieee80211_sae_write_commit(&ic->ic_sae, frm, body_len - 6) :
+        ieee80211_sae_write_confirm(&ic->ic_sae, frm)) != 0) {
+        mbuf_freem(m);
+        return NULL;
+    }
+    if (sae && seq == IEEE80211_AUTH_SAE_COMMIT && ic->ic_sae.peer_ready)
+        ic->ic_sae_confirm_ready = 1;
+    if (sae && seq == IEEE80211_AUTH_SAE_CONFIRM && ic->ic_sae.peer_ready)
+        ic->ic_sae_confirm_sent = 1;
+
+    XYLog("%s: AUTH tx alg=%s seq=%u status=%u peer=%s\n", __func__,
+          sae ? "SAE" : "open", seq, status, ether_sprintf(ni->ni_macaddr));
 
 	return m;
 }

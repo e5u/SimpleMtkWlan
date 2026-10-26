@@ -35,5 +35,5 @@ int main(){
  puts("PASS real delay timing and real dispatch bounds, including masked selectors at/end/beyond table.");}
 '''
 p=out/'test-basics.cpp';p.write_text(pre+delay+'\n'+fn+'\n'+post)
-subprocess.run(['clang++','-std=c++14','-fsanitize=undefined',str(p),'-o',str(p.with_suffix(''))],check=True)
+subprocess.run(['clang++','-std=c++14','-fsanitize=' + __import__('os').environ.get('MTK_TEST_SANITIZERS', 'address,undefined'),str(p),'-o',str(p.with_suffix(''))],check=True)
 subprocess.run([str(p.with_suffix(''))],check=True)

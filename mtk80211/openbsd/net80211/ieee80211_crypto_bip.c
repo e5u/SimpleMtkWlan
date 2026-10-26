@@ -115,6 +115,12 @@ ieee80211_bip_encap(struct ieee80211com *ic, mbuf_t m0,
 	mbuf_t m;
     mbuf_t temp;
 
+	/* Never emit IPN zero or reuse a nonce after the 48-bit counter ends. */
+	if (k->k_tsc >= 0xffffffffffffULL || ctx == NULL ||
+	    mbuf_len(m0) < sizeof(*wh)) {
+		mbuf_freem(m0);
+		return NULL;
+	}
 	wh = mtod(m0, struct ieee80211_frame *);
 	_KASSERT((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
 	    IEEE80211_FC0_TYPE_MGT);
@@ -136,6 +142,10 @@ ieee80211_bip_encap(struct ieee80211com *ic, mbuf_t m0,
 	    mbuf_len(m0) - sizeof(*wh));
 
 	m = m0;
+	while (mbuf_next(m) != NULL) {
+		m = mbuf_next(m);
+		AES_CMAC_Update(&ctx->cmac, mtod(m, u_int8_t *), mbuf_len(m));
+	}
 	/* reserve trailing space for MMIE */
 	if (mbuf_trailingspace(m) < IEEE80211_MMIE_LEN) {
         temp = NULL;
@@ -152,6 +162,7 @@ ieee80211_bip_encap(struct ieee80211com *ic, mbuf_t m0,
 	mmie[0] = IEEE80211_ELEMID_MMIE;
 	mmie[1] = 16;
 	LE_WRITE_2(&mmie[2], k->k_id);
+	k->k_tsc++;
 	LE_WRITE_6(&mmie[4], k->k_tsc);
 	memset(&mmie[10], 0, 8);	/* MMIE MIC field set to 0 */
 
@@ -162,8 +173,6 @@ ieee80211_bip_encap(struct ieee80211com *ic, mbuf_t m0,
 
     mbuf_setlen(m, mbuf_len(m) + IEEE80211_MMIE_LEN);
     mbuf_pkthdr_setlen(m0, mbuf_pkthdr_len(m0) + IEEE80211_MMIE_LEN);
-
-	k->k_tsc++;
 
 	return m0;
  nospace:

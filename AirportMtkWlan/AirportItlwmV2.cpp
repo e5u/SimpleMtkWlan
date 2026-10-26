@@ -14,6 +14,9 @@
 
 #include "AirportItlwmSkywalkInterface.hpp"
 #include "IOPCIEDeviceWrapper.hpp"
+#ifdef AIRPORT_WCL
+#include "WCL/CardCapabilities.hpp"
+#endif
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportItlwm, IO80211Controller);
@@ -369,8 +372,11 @@ bool AirportItlwm::start(IOService *provider)
 
 #ifdef AIRPORT_WCL
     int he_enabled = 0;
+    int wpa3_enabled = 0;
     if (PE_parse_boot_argn("-mtkhe", &he_enabled, sizeof(he_enabled)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
+    if (PE_parse_boot_argn("-mtkwpa3", &wpa3_enabled, sizeof(wpa3_enabled)))
+        fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_WPA3;
 #endif
 
     if (!fHalService->attach(pciNub)) {
@@ -912,42 +918,61 @@ IOReturn AirportItlwm::getHardwareAddress(IOEthernetAddress *addrP)
 
 IOReturn AirportItlwm::setHardwareAddress(const void *addrP, UInt32 addrBytes)
 {
-    if (!fNetIf || !addrP)
+    if (!fNetIf || !addrP) {
+        XYLog("setHardwareAddress invalid netif=%p addr=%p\n", fNetIf, addrP);
         return kIOReturnError;
+    }
 #ifdef AIRPORT_WCL
     const UInt8 *address = static_cast<const UInt8 *>(addrP);
     auto ic = fHalService->get80211Controller();
-    bool initializing = (ic->ic_if.if_flags & IFF_UP) && !(ic->ic_if.if_flags & IFF_RUNNING);
-    auto update = AirportWCL::planMacUpdate(ic->ic_myaddr, address, addrBytes, initializing);
-    if (update == AirportWCL::MacUpdate::Invalid)
+    auto update = AirportWCL::planMacUpdate(ic->ic_myaddr, address, addrBytes);
+    XYLog("setHardwareAddress request=%02x:%02x:%02x:%02x:%02x:%02x current=%s bytes=%u flags=0x%x plan=%d\n",
+         address[0], address[1], address[2], address[3], address[4], address[5],
+         ether_sprintf(ic->ic_myaddr), addrBytes, ic->ic_if.if_flags,
+         static_cast<int>(update));
+    if (update == AirportWCL::MacUpdate::Invalid) {
+        XYLog("setHardwareAddress rejected invalid address\n");
         return kIOReturnBadArgument;
-    if (update == AirportWCL::MacUpdate::Busy) {
-        return kIOReturnBusy;
     }
-    if (!bsdInterface || !bsdInterface->getIfnet())
+    if (!bsdInterface || !bsdInterface->getIfnet()) {
+        XYLog("setHardwareAddress missing BSD ifnet=%p\n", bsdInterface);
         return kIOReturnNotReady;
+    }
     // WCL calls this directly, bypassing IOEthernetInterface's normal MAC ioctl.
     // Update the BSD address used by DHCP/ARP as well as the firmware address.
     errno_t error = ifnet_set_lladdr(bsdInterface->getIfnet(), address, addrBytes);
+    XYLog("setHardwareAddress ifnet_set_lladdr result=%d\n", error);
     if (error)
         return kIOReturnError;
     bsdInterface->setProperty(kIOMACAddress, const_cast<UInt8 *>(address), addrBytes);
     // WCL replays the current address after every driver-available notification.
     // Keep BSD synchronized, but do not restart firmware for a replay.
     if (update == AirportWCL::MacUpdate::Unchanged) {
+        XYLog("setHardwareAddress replay unchanged\n");
         return kIOReturnSuccess;
     }
 #endif
     if_setlladdr(&fHalService->get80211Controller()->ic_ac.ac_if, (const UInt8 *)addrP);
 #ifdef AIRPORT_WCL
-    if (ic->ic_if.if_flags & IFF_RUNNING) {
-        ic->ic_wcl_mac_reconfig = true;
+    if (ic->ic_if.if_flags & IFF_UP) {
+        XYLog("setHardwareAddress restarting HAL old=%s new=%s flags=0x%x\n",
+             ether_sprintf(ic->ic_myaddr), ether_sprintf(address), ic->ic_if.if_flags);
+        ic->ic_wcl_mac_reconfig = AirportWCL::MacRestartStopping;
 #else
     if (fHalService->get80211Controller()->ic_state > IEEE80211_S_INIT) {
 #endif
-        fHalService->disable(bsdInterface);
-        fHalService->enable(bsdInterface);
+        IOReturn status = fHalService->disable(bsdInterface);
+        if (status == kIOReturnSuccess)
+            status = fHalService->enable(bsdInterface);
+#ifdef AIRPORT_WCL
+        if (status != kIOReturnSuccess)
+            ic->ic_wcl_mac_reconfig = AirportWCL::MacRestartNone;
+#endif
+        XYLog("setHardwareAddress HAL restart result=0x%x\n", status);
+        if (status != kIOReturnSuccess)
+            return status;
     }
+    XYLog("setHardwareAddress complete now=%s\n", ether_sprintf(ic->ic_myaddr));
     return kIOReturnSuccess;
 }
 
@@ -1062,6 +1087,16 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+#if __IO80211_TARGET == __MAC_26_0
+    MtkWclCardCapabilities::advertiseWpa3(cd->capabilities,
+        (fHalService->get80211Controller()->ic_userflags & IEEE80211_F_WPA3) != 0,
+        (caps & IEEE80211_C_MFP) != 0);
+    XYLog("WCL card capabilities userflags=0x%x ic_caps=0x%x caps9=0x%x sae=%u bip=%u\n",
+          fHalService->get80211Controller()->ic_userflags, caps,
+          cd->capabilities[9],
+          (cd->capabilities[9] & MtkWclCardCapabilities::kSae) != 0,
+          (cd->capabilities[9] & MtkWclCardCapabilities::kBip) != 0);
+#endif
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;

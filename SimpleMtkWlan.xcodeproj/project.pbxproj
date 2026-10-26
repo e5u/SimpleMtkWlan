@@ -14,6 +14,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A5AE00000000000000000001 /* ieee80211_sae.c in Sources */ = {isa = PBXBuildFile; fileRef = A5AE00000000000000000011 /* ieee80211_sae.c */; };
+		A5AE00000000000000000002 /* uECC.c in Sources */ = {isa = PBXBuildFile; fileRef = A5AE00000000000000000013 /* uECC.c */; };
+		A5AE00000000000000000003 /* LICENSE-hostap.txt in Resources */ = {isa = PBXBuildFile; fileRef = A5AE00000000000000000019 /* LICENSE-hostap.txt */; };
+		A5AE00000000000000000004 /* LICENSE-micro-ecc.txt in Resources */ = {isa = PBXBuildFile; fileRef = A5AE00000000000000000018 /* LICENSE-micro-ecc.txt */; };
 		024A07B023FCBC3C009FBA6C /* SimpleMtkWlan.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 024A07AF23FCBC3C009FBA6C /* SimpleMtkWlan.hpp */; };
 		024A07B223FCBC3C009FBA6C /* SimpleMtkWlan.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 024A07B123FCBC3C009FBA6C /* SimpleMtkWlan.cpp */; };
 		F1A0C0DE00000000000000B1 /* MtkLog.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F1A0C0DE00000000000000F1 /* MtkLog.cpp */; };
@@ -133,6 +137,15 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		A5AE00000000000000000011 /* ieee80211_sae.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = ieee80211_sae.c; sourceTree = "<group>"; };
+		A5AE00000000000000000012 /* ieee80211_sae.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ieee80211_sae.h; sourceTree = "<group>"; };
+		A5AE00000000000000000013 /* uECC.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = uECC.c; sourceTree = "<group>"; };
+		A5AE00000000000000000014 /* uECC.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = uECC.h; sourceTree = "<group>"; };
+		A5AE00000000000000000015 /* uECC_vli.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = uECC_vli.h; sourceTree = "<group>"; };
+		A5AE00000000000000000016 /* types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = types.h; sourceTree = "<group>"; };
+		A5AE00000000000000000017 /* curve-specific.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "curve-specific.inc"; sourceTree = "<group>"; };
+		A5AE00000000000000000018 /* LICENSE-micro-ecc.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "LICENSE-micro-ecc.txt"; sourceTree = "<group>"; };
+		A5AE00000000000000000019 /* LICENSE-hostap.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "LICENSE-hostap.txt"; sourceTree = "<group>"; };
 		024A07AC23FCBC3C009FBA6C /* SimpleMtkWlan.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SimpleMtkWlan.kext; sourceTree = BUILT_PRODUCTS_DIR; };
 		024A07AF23FCBC3C009FBA6C /* SimpleMtkWlan.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = SimpleMtkWlan.hpp; sourceTree = "<group>"; };
 		024A07B123FCBC3C009FBA6C /* SimpleMtkWlan.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = SimpleMtkWlan.cpp; sourceTree = "<group>"; };
@@ -415,6 +428,9 @@
 		F8C2EC2E24080319007A9422 /* net80211 */ = {
 			isa = PBXGroup;
 			children = (
+				A5AE00000000000000000011 /* ieee80211_sae.c */,
+				A5AE00000000000000000012 /* ieee80211_sae.h */,
+				A5AE00000000000000000021 /* sae */,
 				F8C2EC2F24080319007A9422 /* ieee80211_proto.c */,
 				F8C2EC3024080319007A9422 /* _string.c */,
 				F8C2EC3124080319007A9422 /* ieee80211_amrr.h */,
@@ -451,6 +467,20 @@
 				F8C594D225FD935B0007D19C /* ieee80211_ra.h */,
 			);
 			path = net80211;
+			sourceTree = "<group>";
+		};
+		A5AE00000000000000000021 /* sae */ = {
+			isa = PBXGroup;
+			children = (
+				A5AE00000000000000000013 /* uECC.c */,
+				A5AE00000000000000000014 /* uECC.h */,
+				A5AE00000000000000000015 /* uECC_vli.h */,
+				A5AE00000000000000000016 /* types.h */,
+				A5AE00000000000000000017 /* curve-specific.inc */,
+				A5AE00000000000000000018 /* LICENSE-micro-ecc.txt */,
+				A5AE00000000000000000019 /* LICENSE-hostap.txt */,
+			);
+			path = sae;
 			sourceTree = "<group>";
 		};
 		F8C2EC8624080556007A9422 /* sys */ = {
@@ -646,6 +676,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A5AE00000000000000000003 /* LICENSE-hostap.txt in Resources */,
+				A5AE00000000000000000004 /* LICENSE-micro-ecc.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -656,6 +688,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A5AE00000000000000000001 /* ieee80211_sae.c in Sources */,
+				A5AE00000000000000000002 /* uECC.c in Sources */,
 				F8A4307325062CE300EA545E /* zutil.c in Sources */,
 				F8294FE424FCBF5100239253 /* FwBinary.cpp in Sources */,
 				B00000000000000000000001 /* MtkMwx.cpp in Sources */,

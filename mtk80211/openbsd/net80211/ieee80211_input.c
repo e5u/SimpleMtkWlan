@@ -76,6 +76,8 @@
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
 
+void ieee80211_try_another_bss(struct ieee80211com *);
+
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
                                  struct ieee80211_node *, mbuf_t,
                                  struct ieee80211_rxinfo *rxi);
@@ -272,6 +274,61 @@ fail:
    /* The input caller replaces its sole reference with our return value. */
    mbuf_freem(m);
    return NULL;
+}
+
+/* Consume a management frame on rejection, just like the crypto helpers.
+ * A hardware "decrypted" indication never substitutes for BIP validation. */
+static mbuf_t
+ieee80211_input_mgmt_protect(struct ieee80211com *ic,
+    struct ieee80211_node *ni, mbuf_t m, struct ieee80211_rxinfo *rxi)
+{
+    /* Management parsers, MMIE lookup and BIP authenticate a contiguous
+     * frame. Do not let a valid MMIE at a segment boundary hide later bytes. */
+    if (mbuf_len(m) != mbuf_pkthdr_len(m) &&
+        mbuf_pullup(&m, mbuf_pkthdr_len(m)) != 0)
+        return NULL;
+    struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+    int subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+    int protected_frame = (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) != 0;
+    int multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+    int robust = subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
+        subtype == IEEE80211_FC0_SUBTYPE_DEAUTH;
+
+    if (subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
+        if (protected_frame) {
+            /* An encrypted category is not available before CCMP decap. */
+            robust = 1;
+        } else {
+            u_int hdrlen = ieee80211_get_hdrlen(wh);
+            if (mbuf_len(m) < hdrlen + 1)
+                goto drop;
+            robust = ieee80211_is_robust_action(mtod(m, u_int8_t *)[hdrlen]);
+        }
+    }
+
+    if (robust && (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT)) {
+        if (multicast) {
+            /* BIP carries an MMIE and has no CCMP IV. Verify the received
+             * FC and MMIE even if firmware claimed hardware decryption. */
+            if (protected_frame)
+                goto drop;
+            return ieee80211_decrypt(ic, m, ni);
+        }
+        /* Require a retained/restored IV so hwdecrypt validates the PN. */
+        if (!protected_frame)
+            goto drop;
+        if (rxi->rxi_flags & IEEE80211_RXI_HWDEC)
+            return ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+        return ieee80211_decrypt(ic, m, ni);
+    }
+    if ((ic->ic_flags & IEEE80211_F_RSNON) &&
+        (protected_frame || (rxi->rxi_flags & IEEE80211_RXI_HWDEC)))
+        goto drop;
+    return m;
+
+drop:
+    mbuf_freem(m);
+    return NULL;
 }
 
 /*
@@ -684,29 +741,10 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                 }
             }
             
-            if (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT) {
-                /* MMPDU protection is on for Rx */
-                if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
-                    subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
-                    subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
-                    if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-                        !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
-                        /* unicast mgmt not encrypted */
-                        goto out;
-                    }
-                    /* do software decryption */
-                    m = ieee80211_decrypt(ic, m, ni);
-                    if (m == NULL) {
-                        /* XXX stats */
-                        goto out;
-                    }
-                    wh = mtod(m, struct ieee80211_frame *);
-                }
-            } else if ((ic->ic_flags & IEEE80211_F_RSNON) &&
-                       (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
-                /* encrypted but MMPDU Rx protection off for TA */
+            m = ieee80211_input_mgmt_protect(ic, ni, m, rxi);
+            if (m == NULL)
                 goto out;
-            }
+            wh = mtod(m, struct ieee80211_frame *);
             
 #if NBPFILTER > 0
             if (bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_IN) != 0) {
@@ -1499,6 +1537,8 @@ ieee80211_parse_rsn_akm(const u_int8_t selector[4])
                 return IEEE80211_AKM_SHA256_8021X;
             case 6:    /* PSK with SHA256 KDF */
                 return IEEE80211_AKM_SHA256_PSK;
+            case 8:    /* SAE */
+                return IEEE80211_AKM_SAE;
         }
     }
     return IEEE80211_AKM_NONE;    /* ignore unknown AKMs */
@@ -1707,6 +1747,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     u_int16_t capinfo, bintval;
     u_int8_t chan, bchan, erp, dtim_count, dtim_period;
     int is_new;
+    bool ssidMatchesDesired;
     
     /*
      * We process beacon/probe response frames for:
@@ -1924,6 +1965,15 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     } else
         is_new = 0;
     
+    /*
+     * A station-mode node is keyed by transmitter MAC. Several virtual BSSes
+     * can share that MAC while advertising different SSIDs and RSN IEs. Keep
+     * the record described by a directed join instead of letting whichever
+     * virtual BSS beacon arrived first or last overwrite it.
+     */
+    ssidMatchesDesired = ic->ic_des_esslen != 0 &&
+        ssid[1] == ic->ic_des_esslen &&
+        memcmp(&ssid[2], ic->ic_des_essid, ssid[1]) == 0;
     ni->ni_chan = &ic->ic_channels[chan];
     
     if (htcaps)
@@ -2060,8 +2110,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
             ni->ni_flags &= ~IEEE80211_NODE_QOS;
     }
     
-    if (ic->ic_state == IEEE80211_S_SCAN ||
-        (ic->ic_flags & IEEE80211_F_BGSCAN)) {
+    if ((ic->ic_state == IEEE80211_S_SCAN ||
+         (ic->ic_flags & IEEE80211_F_BGSCAN)) &&
+        (is_new || ni->ni_esslen == 0 || ssidMatchesDesired)) {
         struct ieee80211_rsnparams rsn, wpa;
         
 #ifdef AIRPORT_WCL
@@ -2136,7 +2187,8 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
      * a non-zero-length SSID filled with zeroes that we may have
      * received earlier in a beacon.
      */
-    if (ssid[1] != 0 && ni->ni_essid[0] == '\0') {
+    if (ssid[1] != 0 &&
+        (is_new || ni->ni_essid[0] == '\0' || ssidMatchesDesired)) {
         ni->ni_esslen = ssid[1];
         memset(ni->ni_essid, 0, sizeof(ni->ni_essid));
         /* we know that ssid[1] <= IEEE80211_NWID_LEN */
@@ -2311,11 +2363,74 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     algo   = LE_READ_2(frm); frm += 2;
     seq    = LE_READ_2(frm); frm += 2;
     status = LE_READ_2(frm); frm += 2;
+    XYLog("%s: AUTH rx alg=%u seq=%u status=%u peer=%s state=%u akm=0x%x\n",
+          __func__, algo, seq, status, ether_sprintf(ni->ni_macaddr),
+          ic->ic_state, ni->ni_rsnakms);
     DPRINTF(("auth %d seq %d from %s\n", algo, seq,
              ether_sprintf((u_int8_t *)wh->i_addr2)));
     
-    /* only "open" auth mode is supported */
-    if (algo != IEEE80211_AUTH_ALG_OPEN) {
+    if (algo == IEEE80211_AUTH_ALG_SAE &&
+        (ic->ic_userflags & IEEE80211_F_WPA3) &&
+        ic->ic_opmode == IEEE80211_M_STA &&
+        ic->ic_state == IEEE80211_S_AUTH && ni == ic->ic_bss &&
+        ni->ni_rsnakms == IEEE80211_AKM_SAE &&
+        IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) &&
+        IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) &&
+        IEEE80211_ADDR_EQ(wh->i_addr3, ni->ni_bssid)) {
+        /* SAE bodies must be contiguous before passing them to the parser. */
+        size_t body_len = mbuf_len(m) - (frm - (const u_int8_t *)wh);
+        if (mbuf_len(m) != mbuf_pkthdr_len(m))
+            return;
+        if (seq == IEEE80211_AUTH_SAE_COMMIT &&
+            status == IEEE80211_STATUS_SAE_ANTI_CLOGGING) {
+            if (ieee80211_sae_set_token(&ic->ic_sae, frm, body_len) == 0)
+                IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_AUTH,
+                    IEEE80211_AUTH_SAE_COMMIT);
+            return;
+        }
+        if (status != 0) {
+            ic->ic_stats.is_rx_auth_fail++;
+            ic->ic_sae_pmk_valid = 0;
+            ic->ic_sae_confirm_ready = 0;
+            ic->ic_sae_confirm_sent = 0;
+            ieee80211_sae_clear(&ic->ic_sae);
+            ieee80211_try_another_bss(ic);
+            return;
+        }
+        if (seq == IEEE80211_AUTH_SAE_COMMIT && !ic->ic_sae.confirmed) {
+            int result = ieee80211_sae_process_commit(&ic->ic_sae,
+                frm, body_len);
+            if (result == 1)
+                return;
+            if (result != 0)
+                return;
+            IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_AUTH,
+                IEEE80211_AUTH_SAE_COMMIT);
+            IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_AUTH,
+                IEEE80211_AUTH_SAE_CONFIRM);
+            return;
+        }
+        if (seq == IEEE80211_AUTH_SAE_CONFIRM && ic->ic_sae.peer_ready) {
+            if (!ic->ic_sae_confirm_sent)
+                return;
+            if (ieee80211_sae_check_confirm(&ic->ic_sae, frm,
+                body_len) != 0)
+                return;
+            memcpy(ni->ni_pmk, ic->ic_sae.pmk, IEEE80211_PMK_LEN);
+            memcpy(ni->ni_pmkid, ic->ic_sae.pmkid, IEEE80211_PMKID_LEN);
+            ni->ni_flags |= IEEE80211_NODE_PMKID;
+            ic->ic_sae_pmk_valid = 1;
+            ieee80211_new_state(ic, IEEE80211_S_ASSOC,
+                wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK);
+            return;
+        }
+        ic->ic_stats.is_rx_bad_auth++;
+        return;
+    }
+    /* Only Open and the selected SAE transaction are accepted. */
+    if (algo != IEEE80211_AUTH_ALG_OPEN ||
+        (ic->ic_opmode == IEEE80211_M_STA &&
+        ni->ni_rsnakms == IEEE80211_AKM_SAE)) {
         DPRINTF(("unsupported auth algorithm %d from %s\n",
                  algo, ether_sprintf((u_int8_t *)wh->i_addr2)));
         ic->ic_stats.is_rx_auth_unsupported++;

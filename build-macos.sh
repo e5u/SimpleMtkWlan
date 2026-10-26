@@ -29,6 +29,7 @@ common_sources=(
 	include/FwBinary.cpp include/HAL/MtkHalService.cpp mtk80211/compat.cpp mtk80211/zutil.c
 	$(cd "$here" && ls mtk80211/openbsd/crypto/*.c)
 	$(cd "$here" && ls mtk80211/openbsd/net80211/*.c mtk80211/openbsd/net80211/*.cpp)
+	mtk80211/openbsd/net80211/sae/uECC.c
 	mtk80211/openbsd/sys/arp.c mtk80211/openbsd/sys/_ifq.cpp mtk80211/openbsd/sys/_mbuf.cpp
 	mtk80211/openbsd/sys/_task.cpp
 	SimpleMtkWlan/hal_mwx/MtkMwx.cpp SimpleMtkWlan/MtkLog.cpp
@@ -42,7 +43,12 @@ build() {
 	shift
 	sources=("$@")
 	local obj="$out/obj-$name" bundle="$out/$name.kext"
-	rm -rf "$obj" "$bundle"; mkdir -p "$obj" "$bundle/Contents/MacOS"
+	local previous
+	previous="$(mktemp -d /tmp/simplemtk-build.XXXXXXXX)"
+	for artifact in "$obj" "$bundle"; do
+		[[ ! -e "$artifact" ]] || mv "$artifact" "$previous/"
+	done
+	mkdir -p "$obj" "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 	local incs=(-I "$sdkhdr")
 	for d in mtk80211/openbsd mtk80211 include; do incs+=(-isystem "$here/$d"); done
 	while IFS= read -r d; do incs+=(-I "$d"); done < <(find "$here/SimpleMtkWlan" "$here/include" "$here/mtk80211" -type d)
@@ -92,6 +98,9 @@ for k, v in {"$(DEVELOPMENT_LANGUAGE)": "en", "$(EXECUTABLE_NAME)": name,
     s = s.replace(k, v)
 open(dst, "w").write(s)
 PY
+	cp "$here/mtk80211/openbsd/net80211/sae/LICENSE-hostap.txt" \
+		"$here/mtk80211/openbsd/net80211/sae/LICENSE-micro-ecc.txt" \
+		"$bundle/Contents/Resources/"
 	plutil -lint -s "$bundle/Contents/Info.plist"
 	"$otool" -hv "$bundle/Contents/MacOS/$name" | grep -q KEXTBUNDLE || { echo "not a kext bundle" >&2; exit 1; }
 	local syms; syms="$("$nm_tool" "$bundle/Contents/MacOS/$name")"

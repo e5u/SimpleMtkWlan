@@ -132,6 +132,62 @@ ieee80211_crypto_clear_groupkeys(struct ieee80211com *ic)
             (*ic->ic_delete_key)(ic, NULL, k);
         explicit_bzero(k, sizeof(*k));
     }
+    ic->ic_igtk_kid = 0;
+}
+
+int
+ieee80211_has_igtk(const struct ieee80211com *ic)
+{
+    const struct ieee80211_key *k;
+
+    if (ic->ic_igtk_kid != 4 && ic->ic_igtk_kid != 5)
+        return 0;
+    k = &ic->ic_nw_keys[ic->ic_igtk_kid];
+    return k->k_id == ic->ic_igtk_kid &&
+        k->k_cipher == IEEE80211_CIPHER_BIP && k->k_len == 16 &&
+        (k->k_flags & (IEEE80211_KEY_IGTK | IEEE80211_KEY_SWCRYPTO)) ==
+        (IEEE80211_KEY_IGTK | IEEE80211_KEY_SWCRYPTO) && k->k_priv != NULL;
+}
+
+int
+ieee80211_igtk_kde_valid(enum ieee80211_cipher cipher, const u_int8_t *igtk)
+{
+    return igtk != NULL && cipher == IEEE80211_CIPHER_BIP &&
+        igtk[0] == IEEE80211_ELEMID_VENDOR && igtk[1] == 4 + 24 &&
+        memcmp(&igtk[2], IEEE80211_OUI, 3) == 0 &&
+        igtk[5] == IEEE80211_KDE_IGTK &&
+        (LE_READ_2(&igtk[6]) == 4 || LE_READ_2(&igtk[6]) == 5);
+}
+
+int
+ieee80211_keys_ready(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    return ic->ic_keys_ready == NULL || (*ic->ic_keys_ready)(ic, ni);
+}
+
+int
+ieee80211_eapol_key_data_valid(const struct ieee80211_eapol_key *key)
+{
+    const u_int8_t *data = (const u_int8_t *)(key + 1);
+    size_t remaining = BE_READ_2(key->paylen);
+
+    while (remaining != 0) {
+        /* AES-wrapped Key Data may end in dd followed by zero octets.
+         * Validate the padding without discarding legitimate IE contents. */
+        if (data[0] == IEEE80211_ELEMID_VENDOR &&
+            (remaining == 1 || data[1] == 0)) {
+            for (size_t i = 1; i < remaining; i++)
+                if (data[i] != 0)
+                    return 0;
+            return 1;
+        }
+        if (remaining < 2 || data[1] > remaining - 2)
+            return 0;
+        size_t length = 2 + data[1];
+        data += length;
+        remaining -= length;
+    }
+    return 1;
 }
 
 /*
@@ -226,7 +282,8 @@ ieee80211_get_txkey(struct ieee80211com *ic, const struct ieee80211_frame *wh,
         return &ni->ni_pairwise_key;
 
     /* All other cases (including WEP) use a group key. */
-    if (ni->ni_flags & IEEE80211_NODE_MFP)
+    if ((ni->ni_flags & IEEE80211_NODE_MFP) &&
+        (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT)
         kid = ic->ic_igtk_kid;
     else
         kid = ic->ic_def_txkey;
@@ -410,15 +467,25 @@ ieee80211_kdf(const u_int8_t *key, size_t key_len, const u_int8_t *label,
 /*
  * Derive Pairwise Transient Key (PTK) (see 8.5.1.2).
  */
-void
-ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
+int
+ieee80211_derive_ptk(enum ieee80211_akm akm, enum ieee80211_cipher cipher,
+    const u_int8_t *pmk,
     const u_int8_t *aa, const u_int8_t *spa, const u_int8_t *anonce,
     const u_int8_t *snonce, struct ieee80211_ptk *ptk)
 {
 	void (*kdf)(const u_int8_t *, size_t, const u_int8_t *, size_t,
         const u_int8_t *, size_t, u_int8_t *, size_t);
     u_int8_t buf[2 * IEEE80211_ADDR_LEN + 2 * EAPOL_KEY_NONCE_LEN];
-    int ret;
+    static const u_int8_t label[] = "Pairwise key expansion";
+    size_t label_len = sizeof(label);
+    int ret, tk_len;
+
+    memset(ptk, 0, sizeof(*ptk));
+    tk_len = ieee80211_cipher_keylen(cipher);
+    if ((akm == IEEE80211_AKM_SAE && cipher != IEEE80211_CIPHER_CCMP) ||
+        tk_len < 0 || (size_t)tk_len > sizeof(ptk->tk) ||
+        (tk_len == 0 && cipher != IEEE80211_CIPHER_USEGROUP))
+        return EINVAL;
 
     /* Min(AA,SPA) || Max(AA,SPA) */
     ret = memcmp(aa, spa, IEEE80211_ADDR_LEN) < 0;
@@ -431,8 +498,13 @@ ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
     memcpy(&buf[44], ret ? snonce : anonce, EAPOL_KEY_NONCE_LEN);
 
     kdf = ieee80211_is_sha256_akm(akm) ? ieee80211_kdf : ieee80211_prf;
-    (*kdf)(pmk, IEEE80211_PMK_LEN, (const u_int8_t *)"Pairwise key expansion", 23,
-        buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
+    /* SHA1 PRF includes the label's NUL separator; SHA256 KDF does not.
+     * KDF length is part of the input: CCMP needs 48 bytes, TKIP 64. */
+    if (ieee80211_is_sha256_akm(akm))
+        label_len--;
+    (*kdf)(pmk, IEEE80211_PMK_LEN, label, label_len, buf, sizeof(buf),
+        (u_int8_t *)ptk, sizeof(ptk->kck) + sizeof(ptk->kek) + tk_len);
+    return 0;
 }
 
 static void
@@ -514,6 +586,7 @@ ieee80211_eapol_key_mic(struct ieee80211_eapol_key *key, const u_int8_t *kck)
         /* truncate HMAC-SHA1 to its 128 MSBs */
         memcpy(key->mic, digest, EAPOL_KEY_MIC_LEN);
         break;
+    case EAPOL_KEY_DESC_V0: /* Only accepted for the negotiated SAE AKM. */
     case EAPOL_KEY_DESC_V3:
         AES_CMAC_Init(&ctx.cmac);
         AES_CMAC_SetKey(&ctx.cmac, kck);
@@ -532,15 +605,21 @@ ieee80211_eapol_key_check_mic(struct ieee80211_eapol_key *key,
     const u_int8_t *kck)
 {
 	u_int8_t mic[EAPOL_KEY_MIC_LEN];
+    int mismatch;
 
+    if ((BE_READ_2(key->info) & EAPOL_KEY_VERSION_MASK) > EAPOL_KEY_DESC_V3 ||
+        BE_READ_2(key->len) < sizeof(*key) - 4)
+        return 1;
     memcpy(mic, key->mic, EAPOL_KEY_MIC_LEN);
     memset(key->mic, 0, EAPOL_KEY_MIC_LEN);
     ieee80211_eapol_key_mic(key, kck);
 
-    return timingsafe_bcmp(key->mic, mic, EAPOL_KEY_MIC_LEN) != 0;
+    mismatch = timingsafe_bcmp(key->mic, mic, EAPOL_KEY_MIC_LEN) != 0;
+    memcpy(key->mic, mic, EAPOL_KEY_MIC_LEN);
+    explicit_bzero(mic, sizeof(mic));
+    return mismatch;
 }
 
-#ifndef IEEE80211_STA_ONLY
 /*
  * Encrypt the Key Data field of an EAPOL-Key frame using the specified Key
  * Encryption Key (KEK).  The encryption algorithm can be either ARC4 or
@@ -579,6 +658,7 @@ ieee80211_eapol_key_encrypt(struct ieee80211com *ic,
         rc4_skip(&ctx.rc4, RC4STATE);
         rc4_crypt(&ctx.rc4, data, data, len);
         break;
+    case EAPOL_KEY_DESC_V0:
     case EAPOL_KEY_DESC_V2:
     case EAPOL_KEY_DESC_V3:
         if (len < 16 || (len & 7) != 0) {
@@ -598,7 +678,6 @@ ieee80211_eapol_key_encrypt(struct ieee80211com *ic,
         break;
     }
 }
-#endif	/* IEEE80211_STA_ONLY */
 
 /*
  * Decrypt the Key Data field of an EAPOL-Key frame using the specified Key
@@ -621,6 +700,9 @@ ieee80211_eapol_key_decrypt(struct ieee80211_eapol_key *key,
     info = BE_READ_2(key->info);
     data = (u_int8_t *)(key + 1);
 
+    if (BE_READ_2(key->len) < sizeof(*key) - 4 + len)
+        return 1;
+
     switch (info & EAPOL_KEY_VERSION_MASK) {
     case EAPOL_KEY_DESC_V1:
         /* concatenate the EAPOL-Key IV field and the KEK */
@@ -632,6 +714,7 @@ ieee80211_eapol_key_decrypt(struct ieee80211_eapol_key *key,
         rc4_skip(&ctx.rc4, RC4STATE);
         rc4_crypt(&ctx.rc4, data, data, len);
         return 0;
+    case EAPOL_KEY_DESC_V0:
     case EAPOL_KEY_DESC_V2:
     case EAPOL_KEY_DESC_V3:
         /* Key Data Length must be a multiple of 8 */
@@ -639,7 +722,13 @@ ieee80211_eapol_key_decrypt(struct ieee80211_eapol_key *key,
             return 1;
         len -= 8;    /* AES Key Wrap adds 8 bytes */
         aes_key_wrap_set_key(&ctx.aes, kek, 16);
-        return aes_key_unwrap(&ctx.aes, data, data, len / 8);
+        if (aes_key_unwrap(&ctx.aes, data, data, len / 8) != 0)
+            return 1;
+        /* Keep authenticated padding for the IE parser. Trailing zeroes
+         * may be legitimate key data and do not encode a padding length. */
+        BE_WRITE_2(key->paylen, len);
+        BE_WRITE_2(key->len, sizeof(*key) + len - 4);
+        return 0;
     }
 
     return 1;    /* unknown Key Descriptor Version */

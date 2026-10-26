@@ -53,8 +53,8 @@ hardware layer:
 | Auto-recovery of a wedged chip (DMA stall watchdog, PCIe FLR at attach) | ✅ |
 | Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
 | Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
-| 802.11ax (HE) | ❌ not yet |
-| WPA3-only (SAE) networks | ❌ |
+| 802.11ax (HE) | ⚠️ experimental (`-mtkhe`), host-tested; no hardware interop yet |
+| WPA3-only (SAE) networks | ⚠️ experimental (`-mtkwpa3`), host-tested; no hardware interop yet |
 | Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
 | AirDrop / Handoff / Continuity (AWDL) | ❌ |
 
@@ -95,7 +95,14 @@ they match the same card.
 6. Make sure the card is not hidden (step 4 below), reboot and pick a network
    in the Wi-Fi menu.
 
-`itlwm_he=1` turns on 802.11ax capabilities (experimental, off by default).
+`-mtkhe` turns on 802.11ax capabilities (experimental, off by default).
+`-mtkwpa3` enables WPA3-SAE/PMF (experimental, off by default). The native
+Wi-Fi interface accepts SAE passwords from 1 to 32 bytes; a cached PMK cannot
+be used as an SAE password. SAE currently supports group 19 with
+Hunting-and-Pecking and CCMP/BIP. H2E, SAE-PK and other SAE groups are not
+implemented. Host tests cover the protocol and cryptographic vectors;
+hardware interoperability and a full constant-time audit of the ECC
+arithmetic remain pending.
 
 ### SimpleMtkWlan + SimpleMTK app
 

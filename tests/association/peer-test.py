@@ -77,7 +77,7 @@ void verify_payload(mwx_softc*sc,mbuf*m){
   auto*phy=consume<sta_rec_phy>(m,p,0x15);count++;assert(le16toh(phy->basic_rate)==0x0150&&phy->phy_type==0x31);assert(phy->ampdu==(ni->ni_ampdu_param&0x1f)&&phy->rcpi==0xdc);
   auto*ra=consume<sta_rec_ra_info>(m,p,0x01);count++;assert(le16toh(ra->legacy)==0x3fc0);
   for(int i=0;i<10;i++)assert(ra->rx_mcs_bitmask[i]==(ni->ni_rxmcs[i]&(i<2?sc->sc_ic.ic_sup_mcs[i]:0)));
-  if(sc->sc_tx_amsdu){auto*a=consume<sta_rec_amsdu>(m,p,0x0f);count++;assert(a->max_amsdu_num==8&&a->max_mpdu_size==0&&a->amsdu_en==1&&a->rsv==0);}
+  if(sc->sc_tx_amsdu){auto*a=consume<sta_rec_amsdu>(m,p,0x0f);count++;assert(a->max_amsdu_num==8&&a->max_mpdu_size==1&&a->amsdu_en==1&&a->rsv==0);}
  }
  if(ni->ni_flags&IEEE80211_NODE_VHT){auto*v=consume<sta_rec_vht_v1>(m,p,0x0a);count++;assert(le32toh(v->vht_cap)==ni->ni_vhtcaps);assert(v->vht_rx_mcs_map==htole16(ni->ni_vht_mcsinfo.rx_mcs_map));assert(v->vht_tx_mcs_map==htole16(ni->ni_vht_mcsinfo.tx_mcs_map));}
  auto*state=consume<sta_rec_state>(m,p,0x07);count++;assert(!le32toh(state->flags)&&state->state==2&&!state->action&&!state->rsv[0]);

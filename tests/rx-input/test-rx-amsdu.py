@@ -73,10 +73,10 @@ int main(){
  {MtkRxAmsduState s{};auto a=meta();assert(!feed(s,a,8,1,0));auto b=meta(0,3,1);assert(!feed(s,b,8,2,1));a.format=1;assert(!feed(s,a,8,1,2));b.format=1;verify(feed(s,b,8,3,3),{body(b,8,2),body(b,8,3)},26);clean(s);}
  // 16 interleaved TIDs; sequence wrap and queue isolation are explicit metadata.
  {MtkRxAmsduState s{};for(unsigned i=0;i<16;i++)assert(!feed(s,meta(i,3,4095),8,i,1));assert(s.stats.pending==16);for(unsigned i=0;i<16;i++)verify(feed(s,meta(i,1,4095),8,i,2),{body(meta(i),8,i),body(meta(i),8,i)},26);assert(s.stats.completed==16);for(unsigned i=0;i<16;i++)verify(feed(s,meta(i,1,0),8,i,3),{body(meta(i),8,i)},26);clean(s);}
- // Count and total-body bounds, exactly 3,839 bytes accepted, one more rejected.
+ // Count and total-body bounds, exactly 7,935 bytes accepted, one more rejected.
  {MtkRxAmsduState s{};auto a=meta();for(unsigned i=0;i<64;i++){a.format=i?2:3;assert(!feed(s,a,8,i,i));}a.format=1;assert(!feed(s,a,8,1,64));assert(s.stats.invalid==1&&!s.stats.pending);clean(s);}
- {MtkRxAmsduState s{};auto a=meta();assert(!feed(s,a,1900,1,0));a.format=1;verify(feed(s,a,1909,2,1),{body(a,1900,1),body(a,1909,2)},26);clean(s);}
- {MtkRxAmsduState s{};auto a=meta();assert(!feed(s,a,1900,1,0));a.format=1;assert(!feed(s,a,1910,2,1));assert(s.stats.invalid==1);clean(s);}
+ {MtkRxAmsduState s{};auto a=meta();assert(!feed(s,a,3938,1,0));a.format=1;verify(feed(s,a,3969,2,1),{body(a,3938,1),body(a,3969,2)},26);clean(s);}
+ {MtkRxAmsduState s{};auto a=meta();assert(!feed(s,a,3938,1,0));a.format=1;assert(!feed(s,a,3970,2,1));assert(s.stats.invalid==1);clean(s);}
  // Invalid length, truncation, forged LLC DA, short payload, extra tail, wrong seq/TID.
  for(unsigned k=0;k<11;k++){MtkRxAmsduState s{};auto a=meta(0,1);auto v=bytes(a);switch(k){case 0:v.resize(25);break;case 1:v.pop_back();break;case 2:v.insert(v.end(),4,0);break;case 3:v[26+12]=0xff;break;case 4:v[26+13]=7;break;case 5:v[24]=0;break;case 6:v[22]=1;break;case 7:v[24]^=1;break;case 8:for(unsigned j=0;j<6;j++)v[26+j]=v[4+j]=(uint8_t[]){0xaa,0xaa,3,0,0,0}[j];break;case 9:a.format=0;break;case 10:a.tid=16;break;}assert(!mtkRxAmsduFeed(s,packet(v),a,1,nullptr));assert(s.stats.invalid==1);clean(s);}
  // Allocation failure, unexpectedly short/noncontiguous output, metadata/body copy failures.

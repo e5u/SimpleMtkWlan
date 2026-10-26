@@ -66,5 +66,5 @@ int main(){
 }
 '''
 p=out/'test-queue.cpp';p.write_text(stubs+s+tests);exe=p.with_suffix('')
-subprocess.run(['clang++','-std=c++14','-pthread','-fsanitize=undefined',str(p),'-o',str(exe)],check=True)
+subprocess.run(['clang++','-std=c++14','-pthread','-fsanitize=' + __import__('os').environ.get('MTK_TEST_SANITIZERS', 'address,undefined'),str(p),'-o',str(exe)],check=True)
 r=subprocess.run([str(exe)],capture_output=True,text=True,timeout=30);(out/'test-queue-result.txt').write_text(r.stdout+r.stderr);print(r.stdout,r.stderr);assert r.returncode==0
