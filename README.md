@@ -8,8 +8,8 @@
 
 # SimpleMtkWlan
 
-[![Build](https://github.com/flxxxxddd/SimpleMtkWlan/actions/workflows/build.yml/badge.svg)](https://github.com/flxxxxddd/SimpleMtkWlan/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/flxxxxddd/SimpleMtkWlan)](https://github.com/flxxxxddd/SimpleMtkWlan/releases)
+[![Build](https://github.com/e5u/SimpleMtkWlan/actions/workflows/build.yml/badge.svg)](https://github.com/e5u/SimpleMtkWlan/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/e5u/SimpleMtkWlan)](https://github.com/e5u/SimpleMtkWlan/releases)
 [![License: GPL v2](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
 
 **Wi-Fi for MediaTek MT7921 / MT7921K (AMD RZ608) / MT7922 PCIe cards on macOS.**
@@ -46,6 +46,7 @@ hardware layer:
 | Switching between networks / bands | ✅ |
 | 802.11n (HT20/HT40, MCS 0–15, SGI, RX STBC, WMM) | ✅ |
 | 802.11ac (VHT20/40/80, 2×2 MCS 0–9, RX STBC) | ✅ |
+| 802.11ac VHT160 (MT7922) | ⚠️ experimental (`-mtk160`), opt-in |
 | A-MPDU: RX Block Ack + TX aggregation | ✅ |
 | Hardware TX A-MSDU (inside A-MPDU), VHT beamformee | ✅ |
 | Auto-join at boot, 5 GHz preferred over 2.4 GHz of the same router | ✅ |
@@ -53,7 +54,7 @@ hardware layer:
 | Auto-recovery of a wedged chip (DMA stall watchdog, PCIe FLR at attach) | ✅ |
 | Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
 | Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
-| 802.11ax (HE) | ❌ not yet |
+| 802.11ax (HE, MT7922) | ⚠️ experimental (`-mtkhe`), opt-in |
 | WPA3-only (SAE) networks | ❌ |
 | Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
 | AirDrop / Handoff / Continuity (AWDL) | ❌ |
@@ -64,7 +65,7 @@ hardware layer:
 |---|---|---|---|
 | MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 26.7.1 Tahoe, Intel desktop | `AirportMtkWlan`: native Wi-Fi menu, joins from Keychain, 50+ Mbit/s on 5 GHz VHT80 (weak signal, 100 Mbit/s line) |
 | MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 15.8.1 Sequoia, Intel desktop | `SimpleMtkWlan`: 30–50 Mbit/s on 5 GHz VHT80 (a MacBook in the same spot gets ~85); 2.4 GHz works; joins automatically at boot |
-| MediaTek MT7922 (RZ616) | `14c3:0616` | 15.8.1 Sequoia | native Wi-Fi menu in [pengubow's fork](https://github.com/pengubow/SimpleMtkWlan) (its own HAL) |
+| MediaTek MT7922 (RZ616) | `14c3:0616` | 15.6 / 26.7.1 Tahoe | PCIe attach and MT7922 firmware selection verified; Tahoe native Wi-Fi, WPA2, VHT160/HE160 2-NSS, about 460–500 Mbit/s in the local HTTPS test |
 | MediaTek MT7922 | `14c3:7922` | Tahoe (upstream PR #5) | legacy 20 MHz on 5 GHz |
 | MediaTek MT7921 | `14c3:7961` | — | same chip family as RZ608, expected to work |
 
@@ -78,7 +79,7 @@ they match the same card.
 ### Native Wi-Fi menu (AirportMtkWlan, Tahoe)
 
 1. Download `AirportMtkWlan-Tahoe-x.y.z-RELEASE.zip` (or `-Sequoia-` for macOS
-   15.2+) from [Releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases).
+   15.2+) from [Releases](https://github.com/e5u/SimpleMtkWlan/releases).
 2. Copy `AirportMtkWlan.kext` to `EFI/OC/Kexts/` and add it to
    `Kernel → Add` (same entry as below, `BundlePath` `AirportMtkWlan.kext`,
    `ExecutablePath` `Contents/MacOS/AirportMtkWlan`). Set `MinKernel`
@@ -95,12 +96,13 @@ they match the same card.
 6. Make sure the card is not hidden (step 4 below), reboot and pick a network
    in the Wi-Fi menu.
 
-`itlwm_he=1` turns on 802.11ax capabilities (experimental, off by default).
+`-mtkhe` enables 802.11ax association and data paths on MT7922. It is
+experimental and disabled by default.
 
 ### SimpleMtkWlan + SimpleMTK app
 
 1. Download the latest `SimpleMtkWlan-x.y.z-RELEASE.zip` from
-   [Releases](https://github.com/flxxxxddd/SimpleMtkWlan/releases) (or build it yourself, see below).
+   [Releases](https://github.com/e5u/SimpleMtkWlan/releases) (or build it yourself, see below).
 2. Copy `SimpleMtkWlan.kext` to `EFI/OC/Kexts/`.
 3. Add it to `config.plist → Kernel → Add`:
 
@@ -125,7 +127,14 @@ they match the same card.
 5. Install [SimpleMTK](https://github.com/laobamac/SimpleMTKClient), reboot and
    join a network from the menu bar.
 
-Optional boot-args: `-novht`, `-noht40`, `-mtknoamsdu` (no TX A-MSDU).
+Optional boot-args:
+
+* `-mtkhe` — experimental 802.11ax on MT7922.
+* `-mtk160` — experimental 160 MHz operation on MT7922.
+* `-mtkrxamsdu` — enable RX A-MSDU decapsulation.
+* `-mtknoamsdu` — disable hardware TX A-MSDU.
+* `-mtkno160`, `-mtknopool`, `-mtknowtblba`, `-novht`, `-noht40` — targeted
+  diagnostic fallbacks.
 
 ## Troubleshooting
 
@@ -172,7 +181,7 @@ headers come from [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacK
 which is a git submodule.
 
 ```sh
-git clone --recurse-submodules https://github.com/flxxxxddd/SimpleMtkWlan.git
+git clone --recurse-submodules https://github.com/e5u/SimpleMtkWlan.git
 cd SimpleMtkWlan
 xcodebuild -project SimpleMtkWlan.xcodeproj -scheme SimpleMtkWlan \
   -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
@@ -194,7 +203,7 @@ AIRPORT_OS=sequoia ./build-macos.sh Release AirportMtkWlan     # Sequoia 15.2+
 ```
 
 Host tests (extract real driver functions and run them against stubs with
-ASan/UBSan):
+UBSan by default; CI can enable ASan as well):
 
 ```sh
 ./tests/run-all.sh
@@ -272,8 +281,17 @@ On top of upstream and [PR #5](https://github.com/laobamac/SimpleMtkWlan/pull/5)
   the network and masks interrupts; on wake it takes the chip back (WFSYS
   reset / PCIe FLR if needed) and reloads the firmware. Before, the first
   interrupt after wake read a stale DMA ring and panicked.
-* **Build:** builds from a clean clone (MacKernelSDK submodule, no absolute
-  paths), host tests fixed, CI + releases.
+* **MT7922 PCIe / 802.11ax:** recognize the RZ616 PCIe ID (`14c3:0616`),
+  select MT7922 firmware, negotiate HE80/HE160 behind `-mtkhe`, and retain
+  VHT160 as the fallback path behind `-mtk160`.
+* **RX path:** use a low-4 GiB DMA page pool so received frames land directly
+  in mbufs, with the normal MCLGET path retained as fallback.
+* **Interrupt scheduling:** move dispatch to `IOFilterInterruptEventSource`
+  and bound RX rescheduling to one work item per interrupt.
+* **WCL:** honor the system roaming lock and expose TX backpressure counters
+  for native Wi-Fi diagnostics.
+* **Tests and build:** expand host coverage for HE TLVs, DMA pooling,
+  A-MSDU/A-MPDU, scan and roaming; build from a clean clone with CI releases.
 
 ## License
 
